@@ -1,5 +1,0 @@
-streamlit
-pyrebase4
-firebase-admin
-python-docx
-requests
