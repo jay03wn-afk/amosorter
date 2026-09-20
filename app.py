@@ -32,15 +32,17 @@ except:
     pass 
 
 if not firebase_admin._apps:
-    # 判斷是否在 Streamlit Cloud 環境 (有設定 secrets)
-    if "firebase_key" in st.secrets:
-        # 將 secrets 轉為 Python 字典
-        cert_dict = dict(st.secrets["firebase_key"])
-        # 修正 JSON 轉 TOML 時可能產生的換行符號跳脫問題
-        cert_dict["private_key"] = cert_dict["private_key"].replace("\\n", "\n")
-        cred = credentials.Certificate(cert_dict)
-    else:
-        # 本地測試環境：直接讀取實體檔案
+    # 使用 try-except 捕捉本地端沒有 secrets.toml 的錯誤
+    try:
+        if "firebase_key" in st.secrets:
+            # 雲端環境：將 secrets 轉為 Python 字典
+            cert_dict = dict(st.secrets["firebase_key"])
+            cert_dict["private_key"] = cert_dict["private_key"].replace("\\n", "\n")
+            cred = credentials.Certificate(cert_dict)
+        else:
+            cred = credentials.Certificate('firebase-key.json')
+    except Exception:
+        # 本地環境：如果找不到 secrets 檔案或發生錯誤，直接讀取本地 JSON 實體檔案
         cred = credentials.Certificate('firebase-key.json')
 
     firebase_admin.initialize_app(cred, {
@@ -168,11 +170,14 @@ def load_from_cloud():
         st.session_state.files_meta = data.get("files_meta", [])
         st.session_state.active_file_id = data.get("active_file_id", None)
     
-    st.session_state.questions = [doc.to_dict() for doc in db.collection("users").document(uid).collection("questions").stream()]
+    raw_qs = [doc.to_dict() for doc in db.collection("users").document(uid).collection("questions").stream()]
+    # 根據 file_id 與原始題號順序 (order_index) 排序，確保重新載入後順序不亂
+    st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
 
 def parse_docx_with_images(file, file_id, uid):
     doc = Document(file)
     parsed_q = []
+    q_count = 0  # 紀錄題目的原始順序
     for table in doc.tables:
         for row in table.rows:
             q_blocks = []
@@ -199,19 +204,29 @@ def parse_docx_with_images(file, file_id, uid):
             text_only = "".join([b["content"] for b in q_blocks if b["type"]=="text"])
             if q_blocks and text_only not in [q.get('_raw_text', '') for q in parsed_q]:
                 parsed_q.append({
-                    "q_id": str(uuid.uuid4()), "file_id": file_id, "blocks": q_blocks, 
-                    "category": "未分類", "year_info": "", "_raw_text": text_only 
+                    "q_id": str(uuid.uuid4()), 
+                    "file_id": file_id, 
+                    "order_index": q_count,  # 儲存題目原始順序
+                    "blocks": q_blocks, 
+                    "category": "未分類", 
+                    "year_info": "", 
+                    "_raw_text": text_only 
                 })
+                q_count += 1
     return parsed_q
 
 def login_ui():
     st.title("系統登入")
     email = st.text_input("帳號 (Email)")
     password = st.text_input("密碼", type="password")
+    remember_me = st.checkbox("記住我的登入狀態", value=True)
+    
     if st.button("安全登入", icon=":material/login:"):
         try:
             user = auth.sign_in_with_email_and_password(email, password)
             st.session_state.user = user
+            if remember_me:
+                st.query_params["remember_token"] = user['refreshToken']
             load_from_cloud()
             st.rerun()
         except Exception as e:
@@ -277,6 +292,7 @@ def main_app():
     st.sidebar.divider()
     if st.sidebar.button("登出系統", icon=":material/logout:"):
         st.session_state.user = None
+        st.query_params.clear()
         st.rerun()
 
     # ---------- 頁面 1：檔案管理 ----------
@@ -667,6 +683,28 @@ def main_app():
                                         zip_file.writestr(f"分類_{cat.replace('/', '_')}.docx", doc_buffer.getvalue())
                             st.download_button("下載壓縮檔 (ZIP)", zip_buffer.getvalue(), "分類題庫打包.zip", "application/zip")
 
+# ==========================================
+# 自動登入與畫面路由
+# ==========================================
+
+# 1. 自動登入檢查：若尚未登入但瀏覽器網址列記有 token，則進行自動認證
+if st.session_state.user is None and "remember_token" in st.query_params:
+    try:
+        token = st.query_params["remember_token"]
+        # 呼叫 Firebase API 刷新 Token
+        user_info = auth.refresh(token)
+        # Google API 刷新後回傳的鍵值通常是 'user_id'
+        user_info["localId"] = user_info.get("user_id") 
+        
+        st.session_state.user = user_info
+        load_from_cloud()
+        
+    except Exception as e:
+        # 如果憑證過期或刷新失敗，不要默默清除，顯示出錯誤原因
+        st.error(f"⚠️ 自動登入失效，請重新登入。系統訊息: {e}")
+        del st.query_params["remember_token"]
+
+# 2. 根據登入狀態渲染畫面
 if st.session_state.user is None:
     login_ui()
 else:
