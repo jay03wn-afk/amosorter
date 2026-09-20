@@ -165,18 +165,21 @@ def load_user_profile():
         db.collection("users").document(uid).set(default_profile)
         st.session_state.user_profile = default_profile
 
-def load_all_users():
+@st.cache_data(ttl=300)
+def fetch_all_users_cached():
     docs = db.collection("users").stream()
     valid_users = {}
     for doc in docs:
         data = doc.to_dict()
         if data and data.get("email"):
             valid_users[doc.id] = data
-    st.session_state.all_users = valid_users
+    return valid_users
+
+def load_all_users():
+    st.session_state.all_users = fetch_all_users_cached()
 
 def load_from_cloud():
     load_user_profile()
-    load_all_users()
     
     workspace_doc = db.collection("workspaces").document(SHARED_WORKSPACE).get()
     if workspace_doc.exists:
@@ -184,8 +187,8 @@ def load_from_cloud():
         st.session_state.categories = data.get("categories", ["生藥", "中藥", "法規", "實務"])
         st.session_state.files_meta = data.get("files_meta", [])
         st.session_state.active_file_id = data.get("active_file_id", None)
+        st.session_state.category_counts = data.get("category_counts", {})
     
-    # [優化] 廢除全站一次性下載，清空本地快取標記
     st.session_state.questions = []
     st.session_state.loaded_page = None
 
@@ -208,18 +211,25 @@ def update_single_question_category(q_id, category, year_info, is_doubt=None):
     now_unclassified = (category == "未分類")
     file_id = q.get("file_id")
 
-    # 1. 為了 Lazy Loading 更新 files_meta 的分類計數，避免反覆向資料庫查詢
+    # 1. 為了 Lazy Loading 更新 files_meta 的分類計數，並即時更新統計地圖 (大幅減少數據庫讀取)
+    if old_category != category:
+        db.collection("workspaces").document(SHARED_WORKSPACE).update({
+            f"category_counts.{old_category}": firestore.Increment(-1),
+            f"category_counts.{category}": firestore.Increment(1)
+        })
+        if "category_counts" in st.session_state:
+            st.session_state.category_counts[old_category] = max(0, st.session_state.category_counts.get(old_category, 1) - 1)
+            st.session_state.category_counts[category] = st.session_state.category_counts.get(category, 0) + 1
+
     if was_unclassified and not now_unclassified:
         for f in st.session_state.files_meta:
             if f["file_id"] == file_id:
                 f["categorized_qs"] = f.get("categorized_qs", 0) + 1
-                sync_user_meta()
                 break
     elif not was_unclassified and now_unclassified:
         for f in st.session_state.files_meta:
             if f["file_id"] == file_id:
                 f["categorized_qs"] = max(0, f.get("categorized_qs", 0) - 1)
-                sync_user_meta()
                 break
 
     # 2. 處理點數與使用者紀錄
@@ -647,18 +657,7 @@ def main_app():
     elif st.session_state.current_page == "資料夾管理":
         st.header("雲端資料夾管理")
         
-        # [優化] 僅抓取 Category 欄位以節省流量與記憶體
-        cat_counts = {cat: 0 for cat in st.session_state.categories}
-        cat_counts["未分類"] = 0
-        
-        with st.spinner("同步分類數據中..."):
-            meta_qs = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").select(["category"]).stream()
-            for doc in meta_qs:
-                c = doc.to_dict().get('category', '未分類')
-                if c in cat_counts: 
-                    cat_counts[c] += 1
-                else:
-                    cat_counts[c] = 1 
+        cat_counts = st.session_state.get("category_counts", {}) 
 
         folder_tree = {}
         for cat in st.session_state.categories:
@@ -748,6 +747,78 @@ def main_app():
                     sync_user_meta()
                     st.rerun()
 
+            with st.container(border=True):
+                st.markdown("**排序調整**")
+                sort_level = st.radio("調整對象", ["母資料夾", "子資料夾"], horizontal=True, label_visibility="collapsed")
+                
+                if sort_level == "母資料夾":
+                    main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
+                    if main_folders:
+                        sort_target = st.selectbox("選擇要移動的母資料夾", main_folders, key="sort_main")
+                        
+                        c_up, c_down = st.columns(2)
+                        if c_up.button("上移", icon=":material/arrow_upward:", key="up_main", use_container_width=True):
+                            idx = main_folders.index(sort_target)
+                            if idx > 0:
+                                main_folders[idx], main_folders[idx-1] = main_folders[idx-1], main_folders[idx]
+                                new_categories = []
+                                for mf in main_folders:
+                                    new_categories.extend([c for c in st.session_state.categories if c.split("/")[0] == mf])
+                                st.session_state.categories = new_categories
+                                sync_user_meta()
+                                st.rerun()
+                                
+                        if c_down.button("下移", icon=":material/arrow_downward:", key="down_main", use_container_width=True):
+                            idx = main_folders.index(sort_target)
+                            if idx < len(main_folders) - 1:
+                                main_folders[idx], main_folders[idx+1] = main_folders[idx+1], main_folders[idx]
+                                new_categories = []
+                                for mf in main_folders:
+                                    new_categories.extend([c for c in st.session_state.categories if c.split("/")[0] == mf])
+                                st.session_state.categories = new_categories
+                                sync_user_meta()
+                                st.rerun()
+                    else:
+                        st.caption("尚無資料夾")
+                        
+                else:
+                    main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
+                    if main_folders:
+                        parent_main = st.selectbox("選擇所屬的母資料夾", main_folders, key="sort_parent")
+                        sub_folders = [c for c in st.session_state.categories if c.split("/")[0] == parent_main and c != parent_main]
+                        
+                        if not sub_folders:
+                            st.caption("此母資料夾內無子資料夾")
+                        else:
+                            sort_target = st.selectbox("選擇要移動的子資料夾", sub_folders, key="sort_sub")
+                            c_up, c_down = st.columns(2)
+                            
+                            if c_up.button("上移", icon=":material/arrow_upward:", key="up_sub", use_container_width=True):
+                                idx = sub_folders.index(sort_target)
+                                if idx > 0:
+                                    sub_folders[idx], sub_folders[idx-1] = sub_folders[idx-1], sub_folders[idx]
+                                    old_cat = st.session_state.categories.copy()
+                                    positions = [i for i, c in enumerate(old_cat) if c in sub_folders]
+                                    for pos, new_sub in zip(positions, sub_folders):
+                                        old_cat[pos] = new_sub
+                                    st.session_state.categories = old_cat
+                                    sync_user_meta()
+                                    st.rerun()
+                                    
+                            if c_down.button("下移", icon=":material/arrow_downward:", key="down_sub", use_container_width=True):
+                                idx = sub_folders.index(sort_target)
+                                if idx < len(sub_folders) - 1:
+                                    sub_folders[idx], sub_folders[idx+1] = sub_folders[idx+1], sub_folders[idx]
+                                    old_cat = st.session_state.categories.copy()
+                                    positions = [i for i, c in enumerate(old_cat) if c in sub_folders]
+                                    for pos, new_sub in zip(positions, sub_folders):
+                                        old_cat[pos] = new_sub
+                                    st.session_state.categories = old_cat
+                                    sync_user_meta()
+                                    st.rerun()
+                    else:
+                        st.caption("尚無資料夾")
+
     # ---------- 頁面 3：題庫分類作業 ----------
     elif st.session_state.current_page == "題庫分類作業":
         st.header("題庫分類作業")
@@ -772,10 +843,33 @@ def main_app():
                     curr_idx = active_f.get("current_index", 0)
                     total_q = len(file_qs)
                     
-                    c_title, c_exit = st.columns([4, 1], vertical_alignment="center")
+                    c_title, c_helper, c_exit = st.columns([3, 1, 1], vertical_alignment="center")
                     with c_title:
                         st.markdown(f"**檔案：{active_f['name']}**")
                         st.progress((curr_idx + 1) / total_q, text=f"進度：第 {curr_idx + 1} 題 / 共 {total_q} 題")
+                    with c_helper:
+                        # 懸浮中藥查詢按鈕
+                        with st.popover("中藥查詢", icon=":material/lightbulb:", use_container_width=True):
+                            st.markdown("**中藥分類查詢**")
+                            search_kw = st.text_input("輸入關鍵字", key=f"herb_search_{active_f['file_id']}_{curr_idx}", placeholder="例如: 參")
+                            if search_kw:
+                                try:
+                                    import cate
+                                    import importlib
+                                    importlib.reload(cate) # 強制重新載入，避免系統快取到舊的空白檔案
+                                    
+                                    results = cate.search_herb(search_kw.strip())
+                                    if results:
+                                        for r in results:
+                                            # 將命中的關鍵字標記為紅色粗體
+                                            herb_name = r['herb'].replace(search_kw.strip(), f":red[**{search_kw.strip()}**]")
+                                            st.markdown(f"- {herb_name} : `{r['category']}`")
+                                    else:
+                                        st.caption("查無符合的中藥。")
+                                except ImportError:
+                                    st.error("找不到 cate.py 檔案", icon=":material/error:")
+                                except AttributeError:
+                                    st.error("請確認 cate.py 檔案已儲存，且包含 search_herb 函式。", icon=":material/error:")
                     with c_exit:
                         if st.button("退出分類", icon=":material/exit_to_app:", use_container_width=True):
                             active_f["locked_by"] = None
@@ -887,7 +981,7 @@ def main_app():
             only_doubt = s_col4.checkbox("只看疑問區", value=False)
             
         # [優化] 依據搜尋條件 Lazy Loading 精準下載
-        query_key = f"search_{filter_cat}_{only_doubt}"
+        query_key = f"search_{filter_cat}_{only_doubt}_{search_text.strip()}"
         if st.session_state.loaded_page != query_key:
             with st.spinner("撈取雲端題目中..."):
                 q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
@@ -900,9 +994,11 @@ def main_app():
                         docs = q_ref.where("category", ">=", filter_cat).where("category", "<", filter_cat + "\uf8ff").stream()
                 elif only_doubt:
                     docs = q_ref.where("is_doubt", "==", True).stream()
-                else:
-                    # 全站瀏覽且無分類過濾 (成本最高，僅在此時觸發)
+                elif search_text.strip():
                     docs = q_ref.stream()
+                else:
+                    docs = q_ref.limit(100).stream()
+                    st.info("提示：目前為預覽模式（顯示前 100 題）。請輸入關鍵字或選擇分類進行精確搜尋。", icon=":material/info:")
                     
                 raw_qs = [doc.to_dict() for doc in docs]
                 st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
@@ -1025,11 +1121,12 @@ def main_app():
                 else:
                     with st.spinner("正在從雲端抓取指定資料，這可能需要一點時間..."):
                         
-                        # [優化] 僅抓取要匯出的分類題目，不再依賴全站題目快取
+                        # [優化] 使用 in 批量查詢（每 30 個條件一批），大幅減少連線與請求次數
                         q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
                         export_qs = []
-                        for cat in export_cats:
-                            docs = q_ref.where("category", "==", cat).stream()
+                        for i in range(0, len(export_cats), 30):
+                            batch_cats = export_cats[i:i+30]
+                            docs = q_ref.where("category", "in", batch_cats).stream()
                             export_qs.extend([doc.to_dict() for doc in docs])
                             
                         if export_format == "合併為單一 Word 檔":
