@@ -17,7 +17,7 @@ import string
 import time
 
 # ==========================================
-# 1. Firebase 初始化與設定
+# 1. Firebase 初始化與設定 (採用快取避免重複連線)
 # ==========================================
 firebaseConfig = {
     "apiKey": "AIzaSyA-A3dn0hgJm9JR2NGvijRc3AD2x3sRgng",
@@ -30,33 +30,36 @@ firebaseConfig = {
     "measurementId": "G-ZJZ3ZZP3VM"
 }
 
-try:
-    firebase = pyrebase.initialize_app(firebaseConfig)
-    auth = firebase.auth()
-except:
-    pass 
-
-if not firebase_admin._apps:
+@st.cache_resource
+def init_firebase_connection():
     try:
-        if "firebase_key" in st.secrets:
-            cert_dict = dict(st.secrets["firebase_key"])
-            cert_dict["private_key"] = cert_dict["private_key"].replace("\\n", "\n")
-            cred = credentials.Certificate(cert_dict)
-        else:
-            cred = credentials.Certificate('firebase-key.json')
-    except Exception:
-        cred = credentials.Certificate('firebase-key.json')
+        firebase = pyrebase.initialize_app(firebaseConfig)
+        pyrebase_auth = firebase.auth()
+    except:
+        pyrebase_auth = None
 
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': firebaseConfig['storageBucket']
-    })
-db = firestore.client()
+    if not firebase_admin._apps:
+        try:
+            if "firebase_key" in st.secrets:
+                cert_dict = dict(st.secrets["firebase_key"])
+                cert_dict["private_key"] = cert_dict["private_key"].replace("\\n", "\n")
+                cred = credentials.Certificate(cert_dict)
+            else:
+                cred = credentials.Certificate('firebase-key.json')
+        except Exception:
+            cred = credentials.Certificate('firebase-key.json')
+
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': firebaseConfig['storageBucket']
+        })
+    return pyrebase_auth, firestore.client()
+
+auth, db = init_firebase_connection()
 
 # 設定全局共享工作區 ID
 SHARED_WORKSPACE = "global_shared_workspace"
 ADMIN_EMAIL = "jay03wn@amoo.com"
 
-# 預設頭像選項
 AVATAR_OPTIONS = {
     "黃色探險家": "https://api.dicebear.com/9.x/bottts/svg?seed=Felix",
     "藍色小怪": "https://api.dicebear.com/9.x/bottts/svg?seed=Aneka",
@@ -101,6 +104,8 @@ if "user" not in st.session_state:
     st.session_state.user = None
 if "questions" not in st.session_state:
     st.session_state.questions = []
+if "loaded_page" not in st.session_state:
+    st.session_state.loaded_page = None  # Lazy Loading 頁面標記
 if "categories" not in st.session_state:
     st.session_state.categories = ["生藥", "中藥", "法規", "實務"]
 if "files_meta" not in st.session_state:
@@ -119,7 +124,7 @@ if "all_users" not in st.session_state:
     st.session_state.all_users = {}
 
 # ==========================================
-# 3. 雲端同步與處理模組 
+# 3. 雲端同步與處理模組 (Lazy Loading 版)
 # ==========================================
 def upload_image_to_storage(img_bytes):
     bucket = storage.bucket()
@@ -144,33 +149,18 @@ def load_user_profile():
     
     if doc.exists:
         st.session_state.user_profile = doc.to_dict()
-        
         updates = {}
-        defaults = {
-            "is_setup_complete": True,
-            "points": 0,
-            "categorized_count": 0,
-            "inventory": [],
-            "notifications": []
-        }
+        defaults = {"is_setup_complete": True, "points": 0, "categorized_count": 0, "inventory": [], "notifications": []}
         for k, v in defaults.items():
             if k not in st.session_state.user_profile:
                 st.session_state.user_profile[k] = v
                 updates[k] = v
-                
         if updates:
             db.collection("users").document(uid).update(updates)
     else:
         default_profile = {
-            "uid": uid,
-            "email": email,
-            "nickname": email.split('@')[0] if email else "新用戶",
-            "avatar_url": "",
-            "points": 0,
-            "categorized_count": 0,
-            "inventory": [],
-            "notifications": [],
-            "is_setup_complete": False
+            "uid": uid, "email": email, "nickname": email.split('@')[0] if email else "新用戶",
+            "avatar_url": "", "points": 0, "categorized_count": 0, "inventory": [], "notifications": [], "is_setup_complete": False
         }
         db.collection("users").document(uid).set(default_profile)
         st.session_state.user_profile = default_profile
@@ -195,8 +185,9 @@ def load_from_cloud():
         st.session_state.files_meta = data.get("files_meta", [])
         st.session_state.active_file_id = data.get("active_file_id", None)
     
-    raw_qs = [doc.to_dict() for doc in db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").stream()]
-    st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
+    # [優化] 廢除全站一次性下載，清空本地快取標記
+    st.session_state.questions = []
+    st.session_state.loaded_page = None
 
 def save_questions_to_firestore(new_questions):
     questions_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
@@ -212,6 +203,26 @@ def update_single_question_category(q_id, category, year_info, is_doubt=None):
     q = next((x for x in st.session_state.questions if x['q_id'] == q_id), None)
     if not q: return
 
+    old_category = q.get("category", "未分類")
+    was_unclassified = (old_category == "未分類")
+    now_unclassified = (category == "未分類")
+    file_id = q.get("file_id")
+
+    # 1. 為了 Lazy Loading 更新 files_meta 的分類計數，避免反覆向資料庫查詢
+    if was_unclassified and not now_unclassified:
+        for f in st.session_state.files_meta:
+            if f["file_id"] == file_id:
+                f["categorized_qs"] = f.get("categorized_qs", 0) + 1
+                sync_user_meta()
+                break
+    elif not was_unclassified and now_unclassified:
+        for f in st.session_state.files_meta:
+            if f["file_id"] == file_id:
+                f["categorized_qs"] = max(0, f.get("categorized_qs", 0) - 1)
+                sync_user_meta()
+                break
+
+    # 2. 處理點數與使用者紀錄
     update_data = {"category": category, "year_info": year_info}
     if is_doubt is not None:
         update_data["is_doubt"] = is_doubt
@@ -220,7 +231,7 @@ def update_single_question_category(q_id, category, year_info, is_doubt=None):
         update_data["categorizer_uid"] = uid
         q["categorizer_uid"] = uid
 
-        if q.get("category", "未分類") == "未分類":
+        if was_unclassified:
             db.collection("users").document(uid).update({"categorized_count": firestore.Increment(1)})
             if "user_profile" in st.session_state:
                 st.session_state.user_profile["categorized_count"] = st.session_state.user_profile.get("categorized_count", 0) + 1
@@ -240,8 +251,8 @@ def update_single_question_category(q_id, category, year_info, is_doubt=None):
         update_data["categorizer_uid"] = None
         q["categorizer_uid"] = None
 
+    # 3. 寫入雲端與更新本地記憶體
     db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").document(q_id).update(update_data)
-    
     q["category"] = category
     q["year_info"] = year_info
     if is_doubt is not None:
@@ -261,10 +272,11 @@ def delete_file_data(file_id):
             count = 0
     if count > 0: batch.commit()
 
-    st.session_state.questions = [q for q in st.session_state.questions if q.get("file_id") != file_id]
+    st.session_state.questions = []
+    st.session_state.loaded_page = None
     st.session_state.files_meta = [f for f in st.session_state.files_meta if f.get("file_id") != file_id]
     if st.session_state.active_file_id == file_id:
-        st.session_state.active_file_id = st.session_state.files_meta[0]["file_id"] if st.session_state.files_meta else None
+        st.session_state.active_file_id = None
     sync_user_meta()
 
 def parse_docx_with_images(file, file_id):
@@ -328,9 +340,6 @@ def login_ui():
         except Exception as e:
             st.error("登入失敗，請檢查帳號密碼。")
 
-# ==========================================
-# 3.5 初次登入設定畫面
-# ==========================================
 def setup_ui():
     st.title("歡迎！請完成初次帳號設定")
     st.write("這是您第一次登入，為了系統安全與運作，請重設密碼並指定專屬暱稱。")
@@ -353,14 +362,11 @@ def setup_ui():
             
             try:
                 uid = st.session_state.user['localId']
-                
                 admin_auth.update_user(uid, password=new_pwd)
-                
                 db.collection("users").document(uid).update({
                     "nickname": new_nickname.strip(),
                     "is_setup_complete": True
                 })
-                
                 st.session_state.user_profile["nickname"] = new_nickname.strip()
                 st.session_state.user_profile["is_setup_complete"] = True
                 
@@ -441,8 +447,6 @@ def main_app():
         
     for p_name, p_icon in PAGES.items():
         if st.sidebar.button(p_name, icon=p_icon, use_container_width=True, type="primary" if st.session_state.current_page == p_name else "secondary"):
-            
-            # 當切換離開「題庫分類作業」時，主動釋放該檔案鎖定
             if st.session_state.current_page == "題庫分類作業" and p_name != "題庫分類作業":
                 if st.session_state.active_file_id:
                     for f in st.session_state.files_meta:
@@ -450,13 +454,11 @@ def main_app():
                             f["locked_by"] = None
                             f["locked_at"] = None
                     sync_user_meta()
-                    
             st.session_state.current_page = p_name
             st.rerun()
             
     st.sidebar.divider()
     if st.sidebar.button("登出系統", icon=":material/logout:"):
-        # 登出時也安全釋放鎖定
         if st.session_state.active_file_id:
             for f in st.session_state.files_meta:
                 if f.get("file_id") == st.session_state.active_file_id:
@@ -470,7 +472,15 @@ def main_app():
 
     # ---------- 頁面 1：檔案管理 ----------
     if st.session_state.current_page == "檔案管理":
-        st.header("檔案管理")
+        c_head1, c_head2, c_head3 = st.columns([2, 1, 1], vertical_alignment="bottom")
+        with c_head1:
+            st.header("檔案管理")
+        with c_head2:
+            if st.button("立即刷新", icon=":material/refresh:", use_container_width=True):
+                load_from_cloud()
+                st.rerun()
+        with c_head3:
+            auto_refresh = st.toggle("自動更新狀態", value=False)
         
         if is_admin:
             with st.container(border=True):
@@ -486,11 +496,13 @@ def main_app():
                             file_id = str(uuid.uuid4())
                             new_qs = parse_docx_with_images(uploaded_file, file_id)
                             save_questions_to_firestore(new_qs)
-                            st.session_state.questions.extend(new_qs)
+                            
                             st.session_state.files_meta.append({
                                 "file_id": file_id, "name": uploaded_file.name,
                                 "year": exam_year, "session": exam_session, "completed": False, "current_index": 0,
-                                "locked_by": None, "locked_at": None
+                                "locked_by": None, "locked_at": None,
+                                "total_qs": len(new_qs),
+                                "categorized_qs": 0
                             })
                             st.session_state.active_file_id = file_id
                             sync_user_meta()
@@ -503,9 +515,16 @@ def main_app():
             
         for f in st.session_state.files_meta:
             f_id = f["file_id"]
-            f_qs = [q for q in st.session_state.questions if q.get("file_id") == f_id]
-            total_qs = len(f_qs)
-            categorized_qs = len([q for q in f_qs if q.get("category") != "未分類"])
+            
+            # [優化] 若舊資料沒有題數緩存，自動補齊
+            if "total_qs" not in f:
+                q_docs = list(db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").where("file_id", "==", f_id).select(["category"]).stream())
+                f["total_qs"] = len(q_docs)
+                f["categorized_qs"] = len([doc for doc in q_docs if doc.to_dict().get("category", "未分類") != "未分類"])
+                sync_user_meta()
+                
+            total_qs = f.get("total_qs", 0)
+            categorized_qs = f.get("categorized_qs", 0)
             
             with st.container(border=True):
                 col1, col2, col3, col4 = st.columns([1, 2.5, 1.2, 1], vertical_alignment="center")
@@ -520,19 +539,16 @@ def main_app():
                     if total_qs > 0:
                         st.progress(categorized_qs / total_qs, text=f"進度: {categorized_qs} / {total_qs} 題")
                 with col3:
-                    # 鎖定機制邏輯
                     now = time.time()
                     locked_by = f.get("locked_by")
                     locked_at = f.get("locked_at", 0)
                     
-                    # 偵測是否超過 3 分鐘掛機 (180 秒)
                     if locked_by and (now - locked_at > 180):
                         locked_by = None
                         f["locked_by"] = None
                         f["locked_at"] = None
                         
                     if locked_by and locked_by != current_uid:
-                        # 被其他人佔用中
                         locker_prof = st.session_state.all_users.get(locked_by, {})
                         avatar = locker_prof.get("avatar_url")
                         name = locker_prof.get("nickname", "未知")
@@ -546,9 +562,8 @@ def main_app():
                         
                         st.button("鎖定中", key=f"btn_{f_id}", icon=":material/lock:", disabled=True, use_container_width=True)
                     else:
-                        st.markdown('<div style="height: 25px;"></div>', unsafe_allow_html=True) # 排版佔位
+                        st.markdown('<div style="height: 25px;"></div>', unsafe_allow_html=True) 
                         if st.button("進入分類", key=f"btn_{f_id}", icon=":material/login:", type="primary", use_container_width=True):
-                            # 即時檢查雲端最新鎖定狀態
                             latest_doc = db.collection("workspaces").document(SHARED_WORKSPACE).get()
                             if latest_doc.exists:
                                 latest_meta = latest_doc.to_dict().get("files_meta", [])
@@ -557,14 +572,11 @@ def main_app():
                                 if target_f:
                                     cloud_locked_by = target_f.get("locked_by")
                                     cloud_locked_at = target_f.get("locked_at", 0)
-                                    
-                                    # 若雲端顯示有人佔用且尚未超時
                                     if cloud_locked_by and cloud_locked_by != current_uid and (time.time() - cloud_locked_at <= 180):
                                         st.toast("慢了一步！此檔案剛剛已被其他人進入。")
-                                        load_from_cloud() # 刷新本地端資料以顯示最新鎖定狀態
+                                        load_from_cloud() 
                                         st.rerun()
                                         
-                            # 確定無人佔用，寫入鎖定並進入
                             f["locked_by"] = current_uid
                             f["locked_at"] = time.time()
                             st.session_state.active_file_id = f_id
@@ -574,7 +586,7 @@ def main_app():
                             
                 with col4:
                     if is_admin:
-                        st.markdown('<div style="height: 25px;"></div>', unsafe_allow_html=True) # 排版佔位
+                        st.markdown('<div style="height: 25px;"></div>', unsafe_allow_html=True) 
                         with st.popover("管理", icon=":material/settings:", use_container_width=True):
                             st.markdown("**修改考試資訊**")
                             new_year = st.number_input("考試年份", value=f.get("year", 114), key=f"y_{f_id}")
@@ -584,24 +596,20 @@ def main_app():
                                 f["year"] = new_year
                                 f["session"] = new_sess
                                 
-                                questions_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
+                                q_docs = list(db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").where("file_id", "==", f_id).stream())
                                 batch = db.batch()
                                 count = 0
-                                
-                                for idx, q in enumerate(f_qs):
-                                    if q.get("category") != "未分類":
-                                        new_year_info = f"{new_year}-{new_sess}-{idx + 1}"
-                                        q["year_info"] = new_year_info 
-                                        batch.update(questions_ref.document(q["q_id"]), {"year_info": new_year_info}) 
+                                for idx, doc in enumerate(q_docs):
+                                    q_data = doc.to_dict()
+                                    if q_data.get("category") != "未分類":
+                                        new_year_info = f"{new_year}-{new_sess}-{q_data.get('order_index', idx) + 1}"
+                                        batch.update(doc.reference, {"year_info": new_year_info}) 
                                         count += 1
-                                        
                                         if count >= 400:
                                             batch.commit()
                                             batch = db.batch()
                                             count = 0
-                                if count > 0:
-                                    batch.commit()
-                                    
+                                if count > 0: batch.commit()
                                 sync_user_meta()
                                 st.rerun()
                                 
@@ -610,11 +618,17 @@ def main_app():
                             reset_check = st.text_input("請輸入 `Check` 以確認重置", key=f"check_reset_{f_id}")
                             if st.button("確認重置", key=f"reset_{f_id}", use_container_width=True):
                                 if reset_check == "Check":
-                                    for q in st.session_state.questions:
-                                        if q.get("file_id") == f_id: 
-                                            update_single_question_category(q["q_id"], "未分類", "", False)
+                                    q_docs = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").where("file_id", "==", f_id).stream()
+                                    batch = db.batch()
+                                    for doc in q_docs:
+                                        batch.update(doc.reference, {"category": "未分類", "categorizer_uid": None})
+                                    batch.commit()
+                                    
+                                    f["categorized_qs"] = 0
                                     f["current_index"] = 0
                                     sync_user_meta()
+                                    st.session_state.questions = []
+                                    st.session_state.loaded_page = None
                                     st.success("已重置完成！")
                                     st.rerun()
                                 else:
@@ -624,15 +638,27 @@ def main_app():
                                 delete_file_data(f_id)
                                 st.rerun()
 
+        if auto_refresh:
+            time.sleep(10)
+            load_from_cloud()
+            st.rerun()
+
     # ---------- 頁面 2：資料夾管理 ----------
     elif st.session_state.current_page == "資料夾管理":
         st.header("雲端資料夾管理")
         
+        # [優化] 僅抓取 Category 欄位以節省流量與記憶體
         cat_counts = {cat: 0 for cat in st.session_state.categories}
         cat_counts["未分類"] = 0
-        for q in st.session_state.questions:
-            c = q.get('category', '未分類')
-            if c in cat_counts: cat_counts[c] += 1
+        
+        with st.spinner("同步分類數據中..."):
+            meta_qs = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").select(["category"]).stream()
+            for doc in meta_qs:
+                c = doc.to_dict().get('category', '未分類')
+                if c in cat_counts: 
+                    cat_counts[c] += 1
+                else:
+                    cat_counts[c] = 1 
 
         folder_tree = {}
         for cat in st.session_state.categories:
@@ -716,8 +742,9 @@ def main_app():
                 if c_e2.button("刪除", type="primary", use_container_width=True):
                     to_del = [c for c in st.session_state.categories if c == target_cat or c.startswith(target_cat + "/")]
                     for c in to_del: st.session_state.categories.remove(c)
-                    for q in st.session_state.questions:
-                        if q.get('category') in to_del: update_single_question_category(q["q_id"], "未分類", "")
+                    
+                    st.session_state.questions = []
+                    st.session_state.loaded_page = None
                     sync_user_meta()
                     st.rerun()
 
@@ -731,7 +758,14 @@ def main_app():
             if not active_f: 
                 st.error("找不到檔案", icon=":material/error:")
             else:
-                file_qs = [q for q in st.session_state.questions if q.get("file_id") == active_f["file_id"]]
+                # [優化] Lazy Loading: 只在進入時抓取該檔案的題目
+                if st.session_state.loaded_page != f"classify_{active_f['file_id']}":
+                    with st.spinner("載入試卷題目中..."):
+                        raw_qs = [doc.to_dict() for doc in db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").where("file_id", "==", active_f["file_id"]).stream()]
+                        st.session_state.questions = sorted(raw_qs, key=lambda x: x.get("order_index", 0))
+                        st.session_state.loaded_page = f"classify_{active_f['file_id']}"
+                        
+                file_qs = st.session_state.questions
                 if not file_qs:
                     st.warning("無有效題目", icon=":material/warning:")
                 else:
@@ -743,7 +777,6 @@ def main_app():
                         st.markdown(f"**檔案：{active_f['name']}**")
                         st.progress((curr_idx + 1) / total_q, text=f"進度：第 {curr_idx + 1} 題 / 共 {total_q} 題")
                     with c_exit:
-                        # 退出並釋放鎖定
                         if st.button("退出分類", icon=":material/exit_to_app:", use_container_width=True):
                             active_f["locked_by"] = None
                             active_f["locked_at"] = None
@@ -772,7 +805,6 @@ def main_app():
                         is_doubt = st.checkbox("標記為疑問 (加入疑問區)", value=current_q.get("is_doubt", False), key=f"doubt_chk_{current_q['q_id']}")
                         if is_doubt != current_q.get("is_doubt", False):
                             update_single_question_category(current_q["q_id"], current_q.get("category", "未分類"), current_year_info, is_doubt)
-                            # 心跳更新
                             active_f['locked_at'] = time.time()
                             sync_user_meta()
 
@@ -798,7 +830,6 @@ def main_app():
                             if curr_idx < total_q - 1:
                                 active_f['current_index'] = curr_idx + 1
                                 
-                            # 心跳更新
                             active_f['locked_at'] = time.time()
                             sync_user_meta()
                             st.rerun()
@@ -855,23 +886,34 @@ def main_app():
             
             only_doubt = s_col4.checkbox("只看疑問區", value=False)
             
+        # [優化] 依據搜尋條件 Lazy Loading 精準下載
+        query_key = f"search_{filter_cat}_{only_doubt}"
+        if st.session_state.loaded_page != query_key:
+            with st.spinner("撈取雲端題目中..."):
+                q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
+                
+                if filter_cat != "所有分類":
+                    if filter_cat == "未分類":
+                        docs = q_ref.where("category", "==", "未分類").stream()
+                    else:
+                        # Firestore 前綴搜尋法
+                        docs = q_ref.where("category", ">=", filter_cat).where("category", "<", filter_cat + "\uf8ff").stream()
+                elif only_doubt:
+                    docs = q_ref.where("is_doubt", "==", True).stream()
+                else:
+                    # 全站瀏覽且無分類過濾 (成本最高，僅在此時觸發)
+                    docs = q_ref.stream()
+                    
+                raw_qs = [doc.to_dict() for doc in docs]
+                st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
+                st.session_state.loaded_page = query_key
+                
         filtered_qs = []
         for q in st.session_state.questions:
             if search_text and search_text.lower() not in q.get('_raw_text', '').lower():
                 continue
-                
-            if filter_cat != "所有分類":
-                if filter_cat == "未分類":
-                    if q.get('category', '未分類') != "未分類":
-                        continue
-                else:
-                    q_cat = q.get('category', '未分類')
-                    if q_cat != filter_cat and not q_cat.startswith(filter_cat + "/"):
-                        continue
-                        
             if only_doubt and not q.get('is_doubt', False):
                 continue
-                
             filtered_qs.append(q)
             
         st.write(f"符合條件共 **{len(filtered_qs)}** 題")
@@ -981,13 +1023,21 @@ def main_app():
                 if not export_cats:
                     st.warning("請至少選擇一個資料夾", icon=":material/warning:")
                 else:
-                    with st.spinner("正在產生文件，這可能需要一點時間..."):
+                    with st.spinner("正在從雲端抓取指定資料，這可能需要一點時間..."):
+                        
+                        # [優化] 僅抓取要匯出的分類題目，不再依賴全站題目快取
+                        q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
+                        export_qs = []
+                        for cat in export_cats:
+                            docs = q_ref.where("category", "==", cat).stream()
+                            export_qs.extend([doc.to_dict() for doc in docs])
+                            
                         if export_format == "合併為單一 Word 檔":
                             doc = Document()
                             doc.add_heading(custom_title, 0)
                             
                             for cat in export_cats:
-                                all_cat_qs = [q for q in st.session_state.questions if q.get('category') == cat]
+                                all_cat_qs = [q for q in export_qs if q.get('category') == cat]
                                 cat_qs = [q for q in all_cat_qs if min_year <= get_year_from_info(q.get('year_info', '')) <= max_year]
                                 
                                 if cat_qs:
@@ -1011,7 +1061,7 @@ def main_app():
                             zip_buffer = io.BytesIO()
                             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                                 for cat in export_cats:
-                                    all_cat_qs = [q for q in st.session_state.questions if q.get('category') == cat]
+                                    all_cat_qs = [q for q in export_qs if q.get('category') == cat]
                                     cat_qs = [q for q in all_cat_qs if min_year <= get_year_from_info(q.get('year_info', '')) <= max_year]
                                     
                                     if cat_qs:
@@ -1165,7 +1215,6 @@ if st.session_state.user is None and "remember_token" in st.query_params:
     try:
         token = st.query_params["remember_token"]
         user_info = auth.refresh(token)
-        # 加入雙重鍵值判斷，避免因版本差異導致抓不到 uid
         uid = user_info.get("user_id") or user_info.get("userId")
         
         if not uid:
