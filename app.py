@@ -10,6 +10,7 @@ import zipfile
 import requests
 import uuid
 from datetime import timedelta
+import math
 
 # ==========================================
 # 1. Firebase 初始化與設定
@@ -32,23 +33,23 @@ except:
     pass 
 
 if not firebase_admin._apps:
-    # 使用 try-except 捕捉本地端沒有 secrets.toml 的錯誤
     try:
         if "firebase_key" in st.secrets:
-            # 雲端環境：將 secrets 轉為 Python 字典
             cert_dict = dict(st.secrets["firebase_key"])
             cert_dict["private_key"] = cert_dict["private_key"].replace("\\n", "\n")
             cred = credentials.Certificate(cert_dict)
         else:
             cred = credentials.Certificate('firebase-key.json')
     except Exception:
-        # 本地環境：如果找不到 secrets 檔案或發生錯誤，直接讀取本地 JSON 實體檔案
         cred = credentials.Certificate('firebase-key.json')
 
     firebase_admin.initialize_app(cred, {
         'storageBucket': firebaseConfig['storageBucket']
     })
 db = firestore.client()
+
+# 設定全局共享工作區 ID (達成多帳號共享進度)
+SHARED_WORKSPACE = "global_shared_workspace"
 
 # ==========================================
 # 2. 網頁基本設定 & 狀態管理
@@ -101,27 +102,25 @@ if "recent_folders" not in st.session_state:
     st.session_state.recent_folders = []
 
 # ==========================================
-# 3. 雲端同步與處理模組
+# 3. 雲端同步與處理模組 (改為共享 WorkSpace)
 # ==========================================
-def upload_image_to_storage(uid, img_bytes):
+def upload_image_to_storage(img_bytes):
     bucket = storage.bucket()
     image_id = str(uuid.uuid4())
-    blob = bucket.blob(f"users/{uid}/images/{image_id}.png")
+    blob = bucket.blob(f"workspaces/{SHARED_WORKSPACE}/images/{image_id}.png")
     blob.upload_from_string(img_bytes, content_type='image/png')
     url = blob.generate_signed_url(expiration=timedelta(days=3650))
     return url
 
 def sync_user_meta():
-    if st.session_state.user:
-        uid = st.session_state.user['localId']
-        db.collection("users").document(uid).set({
-            "categories": st.session_state.categories,
-            "files_meta": st.session_state.files_meta,
-            "active_file_id": st.session_state.active_file_id
-        }, merge=True)
+    db.collection("workspaces").document(SHARED_WORKSPACE).set({
+        "categories": st.session_state.categories,
+        "files_meta": st.session_state.files_meta,
+        "active_file_id": st.session_state.active_file_id
+    }, merge=True)
 
-def save_questions_to_firestore(uid, new_questions):
-    questions_ref = db.collection("users").document(uid).collection("questions")
+def save_questions_to_firestore(new_questions):
+    questions_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
     for i in range(0, len(new_questions), 400):
         chunk = new_questions[i:i + 400]
         batch = db.batch()
@@ -129,20 +128,23 @@ def save_questions_to_firestore(uid, new_questions):
             batch.set(questions_ref.document(q["q_id"]), q)
         batch.commit()
 
-def update_single_question_category(q_id, category, year_info):
-    if st.session_state.user:
-        uid = st.session_state.user['localId']
-        db.collection("users").document(uid).collection("questions").document(q_id).update({
-            "category": category, "year_info": year_info
-        })
-        for q in st.session_state.questions:
-            if q["q_id"] == q_id:
-                q["category"] = category
-                q["year_info"] = year_info
-                break
+def update_single_question_category(q_id, category, year_info, is_doubt=None):
+    update_data = {"category": category, "year_info": year_info}
+    if is_doubt is not None:
+        update_data["is_doubt"] = is_doubt
 
-def delete_file_data(uid, file_id):
-    questions_ref = db.collection("users").document(uid).collection("questions")
+    db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").document(q_id).update(update_data)
+    
+    for q in st.session_state.questions:
+        if q["q_id"] == q_id:
+            q["category"] = category
+            q["year_info"] = year_info
+            if is_doubt is not None:
+                q["is_doubt"] = is_doubt
+            break
+
+def delete_file_data(file_id):
+    questions_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
     q_docs = questions_ref.where("file_id", "==", file_id).stream()
     batch = db.batch()
     count = 0
@@ -162,22 +164,20 @@ def delete_file_data(uid, file_id):
     sync_user_meta()
 
 def load_from_cloud():
-    uid = st.session_state.user['localId']
-    user_doc = db.collection("users").document(uid).get()
-    if user_doc.exists:
-        data = user_doc.to_dict()
+    workspace_doc = db.collection("workspaces").document(SHARED_WORKSPACE).get()
+    if workspace_doc.exists:
+        data = workspace_doc.to_dict()
         st.session_state.categories = data.get("categories", ["生藥", "中藥", "法規", "實務"])
         st.session_state.files_meta = data.get("files_meta", [])
         st.session_state.active_file_id = data.get("active_file_id", None)
     
-    raw_qs = [doc.to_dict() for doc in db.collection("users").document(uid).collection("questions").stream()]
-    # 根據 file_id 與原始題號順序 (order_index) 排序，確保重新載入後順序不亂
+    raw_qs = [doc.to_dict() for doc in db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").stream()]
     st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
 
-def parse_docx_with_images(file, file_id, uid):
+def parse_docx_with_images(file, file_id):
     doc = Document(file)
     parsed_q = []
-    q_count = 0  # 紀錄題目的原始順序
+    q_count = 0 
     for table in doc.tables:
         for row in table.rows:
             q_blocks = []
@@ -196,7 +196,7 @@ def parse_docx_with_images(file, file_id, uid):
                                     if para_text.strip():
                                         q_blocks.append({"type": "text", "content": para_text.strip()})
                                         para_text = ""
-                                    img_url = upload_image_to_storage(uid, img_bytes)
+                                    img_url = upload_image_to_storage(img_bytes)
                                     q_blocks.append({"type": "image", "content": img_url})
                     if para_text.strip():
                         q_blocks.append({"type": "text", "content": para_text.strip()})
@@ -206,17 +206,19 @@ def parse_docx_with_images(file, file_id, uid):
                 parsed_q.append({
                     "q_id": str(uuid.uuid4()), 
                     "file_id": file_id, 
-                    "order_index": q_count,  # 儲存題目原始順序
+                    "order_index": q_count,  
                     "blocks": q_blocks, 
                     "category": "未分類", 
                     "year_info": "", 
-                    "_raw_text": text_only 
+                    "_raw_text": text_only,
+                    "is_doubt": False  # 預設非疑問
                 })
                 q_count += 1
     return parsed_q
 
 def login_ui():
     st.title("系統登入")
+    st.info("💡 提示：目前系統設定為所有登入帳號皆共享同一份題庫與分類進度。")
     email = st.text_input("帳號 (Email)")
     password = st.text_input("密碼", type="password")
     remember_me = st.checkbox("記住我的登入狀態", value=True)
@@ -237,7 +239,6 @@ def get_year_from_info(year_info):
     try: return int(str(year_info).split('-')[0])
     except: return 0
 
-# 新增：層級化選擇器元件 (先選主層級，再選次層級)
 def hierarchical_select(label, categories, key_prefix, default_cat=None, include_unclassified=False, col_layout=None):
     main_folders = list(dict.fromkeys([c.split("/")[0] for c in categories]))
     if include_unclassified:
@@ -274,16 +275,15 @@ def hierarchical_select(label, categories, key_prefix, default_cat=None, include
 # 4. 主系統介面
 # ==========================================
 def main_app():
-    uid = st.session_state.user['localId']
-    
-    # 側邊欄導覽
     st.sidebar.title("導覽列")
-    PAGES = ["檔案管理", "資料夾管理", "題庫分類作業", "題目瀏覽", "題目匯出"]
+    PAGES = ["檔案管理", "資料夾管理", "題庫分類作業", "全站題目搜索與瀏覽", "題目匯出"]
     
     if st.session_state.current_page not in PAGES:
-        st.session_state.current_page = "檔案管理"
+        if st.session_state.current_page == "題目瀏覽":
+            st.session_state.current_page = "全站題目搜索與瀏覽"
+        else:
+            st.session_state.current_page = "檔案管理"
         
-    # 控制頁面跳轉
     selected_page = st.sidebar.radio("選擇功能", PAGES, index=PAGES.index(st.session_state.current_page))
     if selected_page != st.session_state.current_page:
         st.session_state.current_page = selected_page
@@ -309,8 +309,8 @@ def main_app():
                 if uploaded_file:
                     with st.spinner("正在解析與上傳..."):
                         file_id = str(uuid.uuid4())
-                        new_qs = parse_docx_with_images(uploaded_file, file_id, uid)
-                        save_questions_to_firestore(uid, new_qs)
+                        new_qs = parse_docx_with_images(uploaded_file, file_id)
+                        save_questions_to_firestore(new_qs)
                         st.session_state.questions.extend(new_qs)
                         st.session_state.files_meta.append({
                             "file_id": file_id, "name": uploaded_file.name,
@@ -337,9 +337,7 @@ def main_app():
                         sync_user_meta()
                 with col2:
                     st.markdown(f"**{f['name']}**")
-                    # 純文字顯示年份與次數資訊
                     st.caption(f"📅 考試資訊：{f.get('year', 114)} 年第 {f.get('session', 2)} 次")
-                    
                     if total_qs > 0:
                         st.progress(categorized_qs / total_qs, text=f"進度: {categorized_qs} / {total_qs} 題")
                 with col3:
@@ -358,24 +356,21 @@ def main_app():
                             f["year"] = new_year
                             f["session"] = new_sess
                             
-                            # 連動更新該檔案底下所有「已分類」題目的 year_info 標記
-                            questions_ref = db.collection("users").document(uid).collection("questions")
+                            questions_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
                             batch = db.batch()
                             count = 0
                             
                             for idx, q in enumerate(f_qs):
                                 if q.get("category") != "未分類":
                                     new_year_info = f"{new_year}-{new_sess}-{idx + 1}"
-                                    q["year_info"] = new_year_info  # 更新本地狀態
-                                    batch.update(questions_ref.document(q["q_id"]), {"year_info": new_year_info})  # 更新雲端資料
+                                    q["year_info"] = new_year_info 
+                                    batch.update(questions_ref.document(q["q_id"]), {"year_info": new_year_info}) 
                                     count += 1
                                     
-                                    # Firestore batch 上限為 500，這裡設定 400 分批提交
                                     if count >= 400:
                                         batch.commit()
                                         batch = db.batch()
                                         count = 0
-                                        
                             if count > 0:
                                 batch.commit()
                                 
@@ -383,14 +378,22 @@ def main_app():
                             st.rerun()
                             
                         st.divider()
-                        if st.button("重置分類", key=f"reset_{f_id}", use_container_width=True):
-                            for q in st.session_state.questions:
-                                if q.get("file_id") == f_id: update_single_question_category(q["q_id"], "未分類", "")
-                            f["current_index"] = 0
-                            sync_user_meta()
-                            st.rerun()
+                        st.markdown("**重置分類**")
+                        reset_check = st.text_input("請輸入 `Check` 以確認重置", key=f"check_reset_{f_id}")
+                        if st.button("確認重置", key=f"reset_{f_id}", use_container_width=True):
+                            if reset_check == "Check":
+                                for q in st.session_state.questions:
+                                    if q.get("file_id") == f_id: 
+                                        update_single_question_category(q["q_id"], "未分類", "", False)
+                                f["current_index"] = 0
+                                sync_user_meta()
+                                st.success("已重置完成！")
+                                st.rerun()
+                            else:
+                                st.error("輸入錯誤，請注意大小寫需為 Check")
+                                
                         if st.button("刪除檔案", key=f"del_{f_id}", type="primary", use_container_width=True):
-                            delete_file_data(uid, f_id)
+                            delete_file_data(f_id)
                             st.rerun()
 
     # ---------- 頁面 2：資料夾管理 ----------
@@ -512,18 +515,24 @@ def main_app():
                     current_q = file_qs[curr_idx]
                     
                     with st.container(border=True):
-                        st.caption(f"目前狀態： `{current_q.get('category', '未分類')}`")
+                        # 顯示當前狀態與疑問區標籤
+                        doubt_badge = "🚨 **(已標記為疑問)**" if current_q.get("is_doubt", False) else ""
+                        st.caption(f"目前狀態： `{current_q.get('category', '未分類')}` {doubt_badge}")
                         for block in current_q.get('blocks', []):
                             if block['type'] == 'text': st.write(block['content'])
                             elif block['type'] == 'image': st.image(block['content'])
 
-                    st.markdown("### 快速分類")
+                    st.markdown("### 快速分類與標記")
                     if not st.session_state.categories:
                         st.info("尚無資料夾")
                     else:
                         current_year_info = f"{active_f['year']}-{active_f['session']}-{curr_idx + 1}"
                         
-                        # 改為層級選擇器佈局
+                        # 疑問區標記功能
+                        is_doubt = st.checkbox("❓ 標記為疑問 (加入疑問區)", value=current_q.get("is_doubt", False), key=f"doubt_chk_{current_q['q_id']}")
+                        if is_doubt != current_q.get("is_doubt", False):
+                            update_single_question_category(current_q["q_id"], current_q.get("category", "未分類"), current_year_info, is_doubt)
+
                         c_sel_main, c_sel_sub, c_btn = st.columns([1.5, 1.5, 1], vertical_alignment="bottom")
                         selected_cat = hierarchical_select(
                             "分類至", 
@@ -534,7 +543,7 @@ def main_app():
                         )
                         
                         if c_btn.button("確定分類", type="primary", use_container_width=True, icon=":material/check_circle:"):
-                            update_single_question_category(current_q["q_id"], selected_cat, current_year_info)
+                            update_single_question_category(current_q["q_id"], selected_cat, current_year_info, is_doubt)
                             
                             st.session_state.last_used_folder = selected_cat
                             if selected_cat in st.session_state.recent_folders:
@@ -548,14 +557,13 @@ def main_app():
                                 sync_user_meta()
                             st.rerun()
 
-                        # 顯示最近使用的五個資料夾快捷列
                         if st.session_state.recent_folders:
                             st.markdown("##### 📌 最近使用的分類快捷鍵")
                             recent_cols = st.columns(5)
                             for i, r_cat in enumerate(st.session_state.recent_folders):
                                 display_name = r_cat.split('/')[-1]
                                 if recent_cols[i].button(display_name, key=f"recent_{r_cat}_{current_q['q_id']}", help=r_cat, use_container_width=True):
-                                    update_single_question_category(current_q["q_id"], r_cat, current_year_info)
+                                    update_single_question_category(current_q["q_id"], r_cat, current_year_info, is_doubt)
                                     
                                     st.session_state.last_used_folder = r_cat
                                     st.session_state.recent_folders.remove(r_cat)
@@ -576,23 +584,68 @@ def main_app():
                     if c4.button("跳轉", icon=":material/keyboard_tab:"):
                         active_f['current_index'] = jump_to - 1; sync_user_meta(); st.rerun()
 
-    # ---------- 頁面 4：題目瀏覽 ----------
-    elif st.session_state.current_page == "題目瀏覽":
-        st.header("題目瀏覽與管理")
+    # ---------- 頁面 4：全站題目搜索與瀏覽 ----------
+    elif st.session_state.current_page == "全站題目搜索與瀏覽":
+        st.header("全站題目搜索與瀏覽")
         
-        # 改為層級選擇器
-        filter_cat = hierarchical_select("預覽", st.session_state.categories, "browse", include_unclassified=True)
-        filtered_qs = [q for q in st.session_state.questions if q.get('category') == filter_cat]
+        # 搜尋與篩選條件
+        with st.container(border=True):
+            st.subheader("篩選條件")
+            s_col1, s_col2, s_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+            search_text = s_col1.text_input("🔍 關鍵字搜尋 (針對題目內容)")
+            
+            cat_options = ["所有分類", "未分類"] + st.session_state.categories
+            filter_cat = s_col2.selectbox("📂 指定資料夾", cat_options)
+            
+            only_doubt = s_col3.checkbox("❓ 只看疑問區", value=False)
+            
+        # 執行過濾
+        filtered_qs = []
+        for q in st.session_state.questions:
+            # 1. 關鍵字過濾
+            if search_text and search_text.lower() not in q.get('_raw_text', '').lower():
+                continue
+            # 2. 分類過濾
+            if filter_cat != "所有分類":
+                if q.get('category', '未分類') != filter_cat and not q.get('category', '').startswith(filter_cat + "/"):
+                    continue
+            # 3. 疑問區過濾
+            if only_doubt and not q.get('is_doubt', False):
+                continue
+                
+            filtered_qs.append(q)
+            
+        st.write(f"📊 符合條件共 **{len(filtered_qs)}** 題")
         
-        st.write(f"共有 {len(filtered_qs)} 題")
-        for q in filtered_qs:
-            with st.expander(f"[{q.get('year_info', '未標記')}]"):
-                for block in q.get('blocks', []):
-                    if block['type'] == 'text': st.write(block['content'])
-                    elif block['type'] == 'image': st.image(block['content'])
-                if st.button("移回未分類", key=f"del_{q.get('q_id')}", icon=":material/delete:"):
-                    update_single_question_category(q["q_id"], "未分類", "")
-                    st.rerun()
+        # 分頁設計 (改善畫面冗長)
+        PAGE_SIZE = 15
+        total_pages = math.ceil(len(filtered_qs) / PAGE_SIZE) if filtered_qs else 1
+        
+        if len(filtered_qs) > 0:
+            page_num = st.number_input("頁碼", min_value=1, max_value=total_pages, value=1)
+            start_idx = (page_num - 1) * PAGE_SIZE
+            end_idx = start_idx + PAGE_SIZE
+            
+            for q in filtered_qs[start_idx:end_idx]:
+                doubt_str = "❓ " if q.get("is_doubt", False) else ""
+                expander_title = f"{doubt_str}[{q.get('year_info', '未標記')}] - 分類: {q.get('category', '未分類')}"
+                
+                with st.expander(expander_title):
+                    for block in q.get('blocks', []):
+                        if block['type'] == 'text': st.write(block['content'])
+                        elif block['type'] == 'image': st.image(block['content'])
+                    
+                    st.divider()
+                    col_act1, col_act2, col_act3 = st.columns([1,1,2])
+                    if col_act1.button("移回未分類", key=f"del_{q.get('q_id')}", icon=":material/delete:"):
+                        update_single_question_category(q["q_id"], "未分類", q.get("year_info", ""))
+                        st.rerun()
+                        
+                    doubt_btn_text = "取消疑問標記" if q.get("is_doubt", False) else "標記為疑問"
+                    if col_act2.button(doubt_btn_text, key=f"toggle_doubt_{q.get('q_id')}"):
+                        new_doubt_status = not q.get("is_doubt", False)
+                        update_single_question_category(q["q_id"], q.get("category", "未分類"), q.get("year_info", ""), new_doubt_status)
+                        st.rerun()
 
     # ---------- 頁面 5：題目匯出 ----------
     elif st.session_state.current_page == "題目匯出":
@@ -602,17 +655,39 @@ def main_app():
             st.subheader("匯出範圍與過濾")
             st.write("請點選母資料夾展開後，勾選欲匯出的子分類：")
             
+            # 全選與全不選機制
+            btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+            
+            all_sub_folders = []
+            for main in list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories])):
+                all_sub_folders.extend([c for c in st.session_state.categories if c == main or c.startswith(main + "/")])
+                
+            if btn_col1.button("✅ 全選"):
+                for sub in all_sub_folders:
+                    st.session_state[f"export_chk_{sub}"] = True
+                st.rerun()
+                
+            if btn_col2.button("❌ 全不選"):
+                for sub in all_sub_folders:
+                    st.session_state[f"export_chk_{sub}"] = False
+                st.rerun()
+            
             export_cats = []
             main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
             
-            # 使用折疊面板 (Expander) 達成「點擊母資料夾才看得到子資料夾」
             cols = st.columns(3)
             for i, main in enumerate(main_folders):
                 sub_folders = [c for c in st.session_state.categories if c == main or c.startswith(main + "/")]
                 with cols[i % 3].expander(f"📁 {main}"):
                     for sub in sub_folders:
-                        # 預設全勾選
-                        if st.checkbox(sub, value=True, key=f"export_{sub}"):
+                        # 綁定 session state 實現全選/全不選聯動
+                        if f"export_chk_{sub}" not in st.session_state:
+                            st.session_state[f"export_chk_{sub}"] = True
+                            
+                        is_checked = st.checkbox(sub, value=st.session_state[f"export_chk_{sub}"], key=f"dynamic_chk_{sub}")
+                        st.session_state[f"export_chk_{sub}"] = is_checked
+                        
+                        if is_checked:
                             export_cats.append(sub)
 
             st.divider()
@@ -686,25 +761,20 @@ def main_app():
 # ==========================================
 # 自動登入與畫面路由
 # ==========================================
-
-# 1. 自動登入檢查：若尚未登入但瀏覽器網址列記有 token，則進行自動認證
 if st.session_state.user is None and "remember_token" in st.query_params:
     try:
         token = st.query_params["remember_token"]
-        # 呼叫 Firebase API 刷新 Token
         user_info = auth.refresh(token)
-        # Google API 刷新後回傳的鍵值通常是 'user_id'
         user_info["localId"] = user_info.get("user_id") 
         
         st.session_state.user = user_info
         load_from_cloud()
+        st.rerun() # 新增：確保讀取雲端資料後重新渲染頁面
         
     except Exception as e:
-        # 如果憑證過期或刷新失敗，不要默默清除，顯示出錯誤原因
         st.error(f"⚠️ 自動登入失效，請重新登入。系統訊息: {e}")
         del st.query_params["remember_token"]
 
-# 2. 根據登入狀態渲染畫面
 if st.session_state.user is None:
     login_ui()
 else:
