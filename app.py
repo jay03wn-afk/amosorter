@@ -9,6 +9,7 @@ import io
 import zipfile
 import requests
 import uuid
+import re
 from datetime import timedelta
 import math
 
@@ -211,14 +212,14 @@ def parse_docx_with_images(file, file_id):
                     "category": "未分類", 
                     "year_info": "", 
                     "_raw_text": text_only,
-                    "is_doubt": False  # 預設非疑問
+                    "is_doubt": False  
                 })
                 q_count += 1
     return parsed_q
 
 def login_ui():
     st.title("系統登入")
-    st.info("💡 提示：目前系統設定為所有登入帳號皆共享同一份題庫與分類進度。")
+    st.info("提示：目前系統設定為所有登入帳號皆共享同一份題庫與分類進度。", icon=":material/lightbulb:")
     email = st.text_input("帳號 (Email)")
     password = st.text_input("密碼", type="password")
     remember_me = st.checkbox("記住我的登入狀態", value=True)
@@ -337,7 +338,7 @@ def main_app():
                         sync_user_meta()
                 with col2:
                     st.markdown(f"**{f['name']}**")
-                    st.caption(f"📅 考試資訊：{f.get('year', 114)} 年第 {f.get('session', 2)} 次")
+                    st.caption(f"考試資訊：{f.get('year', 114)} 年第 {f.get('session', 2)} 次")
                     if total_qs > 0:
                         st.progress(categorized_qs / total_qs, text=f"進度: {categorized_qs} / {total_qs} 題")
                 with col3:
@@ -390,7 +391,7 @@ def main_app():
                                 st.success("已重置完成！")
                                 st.rerun()
                             else:
-                                st.error("輸入錯誤，請注意大小寫需為 Check")
+                                st.error("輸入錯誤，請注意大小寫需為 Check", icon=":material/error:")
                                 
                         if st.button("刪除檔案", key=f"del_{f_id}", type="primary", use_container_width=True):
                             delete_file_data(f_id)
@@ -425,9 +426,9 @@ def main_app():
                     total_qs_in_branch = main_qs_count + sum(cat_counts.get(sub, 0) for sub in sub_folders)
                     
                     is_expanded = main_folder in st.session_state.expanded_folders
-                    icon = "📂" if is_expanded else "📁"
+                    icon_btn = ":material/folder_open:" if is_expanded else ":material/folder:"
                     
-                    if st.button(f"{icon} {main_folder} (共 {total_qs_in_branch} 題)", key=f"toggle_{main_folder}", use_container_width=True):
+                    if st.button(f"{main_folder} (共 {total_qs_in_branch} 題)", key=f"toggle_{main_folder}", icon=icon_btn, use_container_width=True):
                         if is_expanded:
                             st.session_state.expanded_folders.remove(main_folder)
                         else:
@@ -435,10 +436,10 @@ def main_app():
                         st.rerun()
                     
                     if is_expanded:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;📄 **{main_folder} (根目錄)** : `{main_qs_count}` 題")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;- **{main_folder} (根目錄)** : `{main_qs_count}` 題")
                         for sub in sub_folders:
                             sub_name = sub.split("/")[-1]
-                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;📄 {sub_name} : `{cat_counts.get(sub, 0)}` 題")
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;- {sub_name} : `{cat_counts.get(sub, 0)}` 題")
                             
         with c_right:
             st.markdown("### 新增與編輯")
@@ -497,14 +498,14 @@ def main_app():
     elif st.session_state.current_page == "題庫分類作業":
         st.header("題庫分類作業")
         if not st.session_state.active_file_id:
-            st.info("請先至「檔案管理」選擇要分類的檔案。")
+            st.info("請先至「檔案管理」選擇要分類的檔案。", icon=":material/info:")
         else:
             active_f = next((f for f in st.session_state.files_meta if f["file_id"] == st.session_state.active_file_id), None)
-            if not active_f: st.error("找不到檔案")
+            if not active_f: st.error("找不到檔案", icon=":material/error:")
             else:
                 file_qs = [q for q in st.session_state.questions if q.get("file_id") == active_f["file_id"]]
                 if not file_qs:
-                    st.warning("無有效題目")
+                    st.warning("無有效題目", icon=":material/warning:")
                 else:
                     curr_idx = active_f.get("current_index", 0)
                     total_q = len(file_qs)
@@ -515,8 +516,7 @@ def main_app():
                     current_q = file_qs[curr_idx]
                     
                     with st.container(border=True):
-                        # 顯示當前狀態與疑問區標籤
-                        doubt_badge = "🚨 **(已標記為疑問)**" if current_q.get("is_doubt", False) else ""
+                        doubt_badge = " **(已標記為疑問)**" if current_q.get("is_doubt", False) else ""
                         st.caption(f"目前狀態： `{current_q.get('category', '未分類')}` {doubt_badge}")
                         for block in current_q.get('blocks', []):
                             if block['type'] == 'text': st.write(block['content'])
@@ -524,12 +524,11 @@ def main_app():
 
                     st.markdown("### 快速分類與標記")
                     if not st.session_state.categories:
-                        st.info("尚無資料夾")
+                        st.info("尚無資料夾", icon=":material/info:")
                     else:
                         current_year_info = f"{active_f['year']}-{active_f['session']}-{curr_idx + 1}"
                         
-                        # 疑問區標記功能
-                        is_doubt = st.checkbox("❓ 標記為疑問 (加入疑問區)", value=current_q.get("is_doubt", False), key=f"doubt_chk_{current_q['q_id']}")
+                        is_doubt = st.checkbox("標記為疑問 (加入疑問區)", value=current_q.get("is_doubt", False), key=f"doubt_chk_{current_q['q_id']}")
                         if is_doubt != current_q.get("is_doubt", False):
                             update_single_question_category(current_q["q_id"], current_q.get("category", "未分類"), current_year_info, is_doubt)
 
@@ -558,7 +557,7 @@ def main_app():
                             st.rerun()
 
                         if st.session_state.recent_folders:
-                            st.markdown("##### 📌 最近使用的分類快捷鍵")
+                            st.markdown("##### 最近使用的分類快捷鍵")
                             recent_cols = st.columns(5)
                             for i, r_cat in enumerate(st.session_state.recent_folders):
                                 display_name = r_cat.split('/')[-1]
@@ -588,36 +587,47 @@ def main_app():
     elif st.session_state.current_page == "全站題目搜索與瀏覽":
         st.header("全站題目搜索與瀏覽")
         
-        # 搜尋與篩選條件
         with st.container(border=True):
             st.subheader("篩選條件")
-            s_col1, s_col2, s_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
-            search_text = s_col1.text_input("🔍 關鍵字搜尋 (針對題目內容)")
+            s_col1, s_col2, s_col3, s_col4 = st.columns([2, 1.5, 1.5, 1], vertical_alignment="bottom")
+            search_text = s_col1.text_input("關鍵字搜尋 (針對題目內容)")
             
-            cat_options = ["所有分類", "未分類"] + st.session_state.categories
-            filter_cat = s_col2.selectbox("📂 指定資料夾", cat_options)
+            # 使用母子階層設計的資料夾過濾
+            main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
+            main_options = ["所有分類", "未分類"] + main_folders
+            selected_main = s_col2.selectbox("指定母資料夾", main_options, key="filter_main")
+
+            if selected_main in ["所有分類", "未分類"]:
+                filter_cat = selected_main
+                s_col3.selectbox("指定子資料夾", ["-"], disabled=True, key="filter_sub")
+            else:
+                sub_options = ["(全部)"] + [c for c in st.session_state.categories if c == selected_main or c.startswith(selected_main + "/")]
+                selected_sub = s_col3.selectbox("指定子資料夾", sub_options, key="filter_sub")
+                filter_cat = selected_main if selected_sub == "(全部)" else selected_sub
             
-            only_doubt = s_col3.checkbox("❓ 只看疑問區", value=False)
+            only_doubt = s_col4.checkbox("只看疑問區", value=False)
             
-        # 執行過濾
         filtered_qs = []
         for q in st.session_state.questions:
-            # 1. 關鍵字過濾
             if search_text and search_text.lower() not in q.get('_raw_text', '').lower():
                 continue
-            # 2. 分類過濾
+                
             if filter_cat != "所有分類":
-                if q.get('category', '未分類') != filter_cat and not q.get('category', '').startswith(filter_cat + "/"):
-                    continue
-            # 3. 疑問區過濾
+                if filter_cat == "未分類":
+                    if q.get('category', '未分類') != "未分類":
+                        continue
+                else:
+                    q_cat = q.get('category', '未分類')
+                    if q_cat != filter_cat and not q_cat.startswith(filter_cat + "/"):
+                        continue
+                        
             if only_doubt and not q.get('is_doubt', False):
                 continue
                 
             filtered_qs.append(q)
             
-        st.write(f"📊 符合條件共 **{len(filtered_qs)}** 題")
+        st.write(f"符合條件共 **{len(filtered_qs)}** 題")
         
-        # 分頁設計 (改善畫面冗長)
         PAGE_SIZE = 15
         total_pages = math.ceil(len(filtered_qs) / PAGE_SIZE) if filtered_qs else 1
         
@@ -627,25 +637,46 @@ def main_app():
             end_idx = start_idx + PAGE_SIZE
             
             for q in filtered_qs[start_idx:end_idx]:
-                doubt_str = "❓ " if q.get("is_doubt", False) else ""
-                expander_title = f"{doubt_str}[{q.get('year_info', '未標記')}] - 分類: {q.get('category', '未分類')}"
+                raw_text = q.get('_raw_text', '').strip()
+                raw_text_single_line = " ".join(raw_text.splitlines())
                 
-                with st.expander(expander_title):
+                snippet_len = 30
+                snippet = raw_text_single_line[:snippet_len] + "..." if len(raw_text_single_line) > snippet_len else raw_text_single_line
+                    
+                expander_icon = ":material/help:" if q.get("is_doubt", False) else ":material/article:"
+                expander_title = f"[{q.get('year_info', '未標記')}] {snippet} - 分類: {q.get('category', '未分類')}"
+                
+                with st.expander(expander_title, icon=expander_icon):
                     for block in q.get('blocks', []):
-                        if block['type'] == 'text': st.write(block['content'])
+                        if block['type'] == 'text': 
+                            content = block['content']
+                            # 關鍵字文字直接高亮標記紅色粗體
+                            if search_text:
+                                pattern = re.compile(re.escape(search_text), re.IGNORECASE)
+                                content = pattern.sub(lambda m: f":red[**{m.group(0)}**]", content)
+                            st.markdown(content)
                         elif block['type'] == 'image': st.image(block['content'])
                     
                     st.divider()
-                    col_act1, col_act2, col_act3 = st.columns([1,1,2])
+                    col_act1, col_act2, col_act3 = st.columns([1.2, 1.2, 2])
                     if col_act1.button("移回未分類", key=f"del_{q.get('q_id')}", icon=":material/delete:"):
                         update_single_question_category(q["q_id"], "未分類", q.get("year_info", ""))
                         st.rerun()
                         
                     doubt_btn_text = "取消疑問標記" if q.get("is_doubt", False) else "標記為疑問"
-                    if col_act2.button(doubt_btn_text, key=f"toggle_doubt_{q.get('q_id')}"):
+                    if col_act2.button(doubt_btn_text, key=f"toggle_doubt_{q.get('q_id')}", icon=":material/help_center:"):
                         new_doubt_status = not q.get("is_doubt", False)
                         update_single_question_category(q["q_id"], q.get("category", "未分類"), q.get("year_info", ""), new_doubt_status)
                         st.rerun()
+                        
+                    # 支援在瀏覽區直接重新分類
+                    with col_act3.popover("重新分類", icon=":material/drive_file_move:"):
+                        c_main_pop = st.container()
+                        c_sub_pop = st.container()
+                        new_cat = hierarchical_select("選擇新分類", st.session_state.categories, f"reclass_{q['q_id']}", col_layout=(c_main_pop, c_sub_pop))
+                        if st.button("確定移動", key=f"btn_reclass_{q['q_id']}", icon=":material/check_circle:", type="primary", use_container_width=True):
+                            update_single_question_category(q["q_id"], new_cat, q.get("year_info", ""), q.get("is_doubt", False))
+                            st.rerun()
 
     # ---------- 頁面 5：題目匯出 ----------
     elif st.session_state.current_page == "題目匯出":
@@ -655,32 +686,27 @@ def main_app():
             st.subheader("匯出範圍與過濾")
             st.write("請點選母資料夾展開後，勾選欲匯出的子分類：")
             
-            # 全選與全不選機制
-            btn_col1, btn_col2, _ = st.columns([1, 1, 4])
-            
-            all_sub_folders = []
-            for main in list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories])):
-                all_sub_folders.extend([c for c in st.session_state.categories if c == main or c.startswith(main + "/")])
-                
-            if btn_col1.button("✅ 全選"):
-                for sub in all_sub_folders:
-                    st.session_state[f"export_chk_{sub}"] = True
-                st.rerun()
-                
-            if btn_col2.button("❌ 全不選"):
-                for sub in all_sub_folders:
-                    st.session_state[f"export_chk_{sub}"] = False
-                st.rerun()
-            
             export_cats = []
             main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
             
             cols = st.columns(3)
             for i, main in enumerate(main_folders):
                 sub_folders = [c for c in st.session_state.categories if c == main or c.startswith(main + "/")]
-                with cols[i % 3].expander(f"📁 {main}"):
+                
+                with cols[i % 3].expander(main, icon=":material/folder:"):
+                    c_sa, c_da = st.columns(2)
+                    if c_sa.button("全選", key=f"sa_{main}", use_container_width=True):
+                        for sub in sub_folders:
+                            st.session_state[f"export_chk_{sub}"] = True
+                        st.rerun()
+                    if c_da.button("清空", key=f"da_{main}", use_container_width=True):
+                        for sub in sub_folders:
+                            st.session_state[f"export_chk_{sub}"] = False
+                        st.rerun()
+                    
+                    st.divider()
+                    
                     for sub in sub_folders:
-                        # 綁定 session state 實現全選/全不選聯動
                         if f"export_chk_{sub}" not in st.session_state:
                             st.session_state[f"export_chk_{sub}"] = True
                             
@@ -705,7 +731,7 @@ def main_app():
             
             if st.button("開始產生文件", type="primary", icon=":material/download:"):
                 if not export_cats:
-                    st.warning("請至少選擇一個資料夾")
+                    st.warning("請至少選擇一個資料夾", icon=":material/warning:")
                 else:
                     with st.spinner("正在產生文件，這可能需要一點時間..."):
                         if export_format == "合併為單一 Word 檔":
@@ -769,10 +795,10 @@ if st.session_state.user is None and "remember_token" in st.query_params:
         
         st.session_state.user = user_info
         load_from_cloud()
-        st.rerun() # 新增：確保讀取雲端資料後重新渲染頁面
+        st.rerun() 
         
     except Exception as e:
-        st.error(f"⚠️ 自動登入失效，請重新登入。系統訊息: {e}")
+        st.error(f"自動登入失效，請重新登入。系統訊息: {e}", icon=":material/warning:")
         del st.query_params["remember_token"]
 
 if st.session_state.user is None:
