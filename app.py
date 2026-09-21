@@ -1,4 +1,4 @@
-import streamlit as st
+ADMIN_EMAILSimport streamlit as st
 import streamlit.components.v1 as components
 import pyrebase
 import firebase_admin
@@ -441,7 +441,7 @@ def render_categorizer_info(cat_uid):
 # 4. 主系統介面
 # ==========================================
 def main_app():
-    is_admin = (st.session_state.user.get('email') == ADMIN_EMAIL)
+    is_admin = (st.session_state.user.get('email') in ADMIN_EMAILS)
     current_uid = st.session_state.user['localId']
     
     st.sidebar.title("導覽列")
