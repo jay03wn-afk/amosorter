@@ -58,7 +58,10 @@ auth, db = init_firebase_connection()
 
 # 設定全局共享工作區 ID
 SHARED_WORKSPACE = "global_shared_workspace"
-ADMIN_EMAIL = "jay03wn@amoo.com"
+ADMIN_EMAILS = [
+    "jay03wn@amoo.com",
+    "ru@amoo.com"
+]
 
 AVATAR_OPTIONS = {
     "黃色探險家": "https://api.dicebear.com/9.x/bottts/svg?seed=Felix",
