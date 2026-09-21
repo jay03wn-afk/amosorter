@@ -1132,6 +1132,14 @@ def main_app():
                             docs = q_ref.where("category", "in", batch_cats).stream()
                             export_qs.extend([doc.to_dict() for doc in docs])
                             
+                        # 定義排序邏輯：年份(大到小) -> 次數(大到小) -> 題號(小到大)
+                        def sort_qs_desc(q):
+                            parts = str(q.get('year_info', '')).split('-')
+                            y = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+                            s = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                            idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                            return (-y, -s, idx)
+                            
                         if export_format == "合併為單一 Word 檔":
                             doc = Document()
                             doc.add_heading(custom_title, 0)
@@ -1139,6 +1147,7 @@ def main_app():
                             for cat in export_cats:
                                 all_cat_qs = [q for q in export_qs if q.get('category') == cat]
                                 cat_qs = [q for q in all_cat_qs if min_year <= get_year_from_info(q.get('year_info', '')) <= max_year]
+                                cat_qs = sorted(cat_qs, key=sort_qs_desc)
                                 
                                 if cat_qs:
                                     doc.add_heading(f'{cat.replace("/", " - ")}', 1)
@@ -1163,6 +1172,7 @@ def main_app():
                                 for cat in export_cats:
                                     all_cat_qs = [q for q in export_qs if q.get('category') == cat]
                                     cat_qs = [q for q in all_cat_qs if min_year <= get_year_from_info(q.get('year_info', '')) <= max_year]
+                                    cat_qs = sorted(cat_qs, key=sort_qs_desc)
                                     
                                     if cat_qs:
                                         doc = Document()
