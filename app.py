@@ -1,4 +1,4 @@
-ADMIN_EMAILSimport streamlit as st
+import streamlit as st
 import streamlit.components.v1 as components
 import pyrebase
 import firebase_admin
