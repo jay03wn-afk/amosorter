@@ -1205,15 +1205,27 @@ def main_app():
                                 if cat_qs:
                                     doc.add_heading(f'{cat.replace("/", " - ")}', 1)
                                     answers = []
+                                    new_q_num = 1
+                                    
                                     for q in cat_qs:
-                                        if include_year: doc.add_paragraph(f"[{q.get('year_info', '')}]")
-                                        
                                         ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
                                         
+                                        first_text_found = False
+                                        prefix = f"{new_q_num}. "
+                                        if include_year:
+                                            prefix += f"[{q.get('year_info', '')}]"
+                                            
                                         for block in processed_blocks:
-                                            if block['type'] == 'text': 
-                                                doc.add_paragraph(block['content'])
+                                            if block['type'] == 'text':
+                                                content = block['content']
+                                                if not first_text_found:
+                                                    content = prefix + content
+                                                    first_text_found = True
+                                                doc.add_paragraph(content)
                                             elif block['type'] == 'image' and include_images:
+                                                if not first_text_found:
+                                                    doc.add_paragraph(prefix)
+                                                    first_text_found = True
                                                 try:
                                                     img_res = requests.get(block['content'], timeout=10)
                                                     if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
@@ -1222,10 +1234,12 @@ def main_app():
                                         
                                         if separate_answers:
                                             answers.append(ans_found if ans_found else " ")
+                                            
+                                        new_q_num += 1
                                         
                                     if separate_answers and answers:
                                         doc.add_heading("簡答表", level=2)
-                                        num_cols = 5
+                                        num_cols = 10
                                         table = doc.add_table(rows=0, cols=num_cols)
                                         table.style = 'Table Grid'
                                         for i in range(0, len(answers), num_cols):
@@ -1253,15 +1267,27 @@ def main_app():
                                         doc = Document()
                                         doc.add_heading(f'{cat.replace("/", "_")} 題庫', 0)
                                         answers = []
+                                        new_q_num = 1
+                                        
                                         for q in cat_qs:
-                                            if include_year: doc.add_paragraph(f"[{q.get('year_info', '')}]")
-                                            
                                             ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
                                             
+                                            first_text_found = False
+                                            prefix = f"{new_q_num}. "
+                                            if include_year:
+                                                prefix += f"[{q.get('year_info', '')}]"
+                                                
                                             for block in processed_blocks:
-                                                if block['type'] == 'text': 
-                                                    doc.add_paragraph(block['content'])
+                                                if block['type'] == 'text':
+                                                    content = block['content']
+                                                    if not first_text_found:
+                                                        content = prefix + content
+                                                        first_text_found = True
+                                                    doc.add_paragraph(content)
                                                 elif block['type'] == 'image' and include_images:
+                                                    if not first_text_found:
+                                                        doc.add_paragraph(prefix)
+                                                        first_text_found = True
                                                     try:
                                                         img_res = requests.get(block['content'], timeout=10)
                                                         if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
@@ -1269,10 +1295,12 @@ def main_app():
                                             
                                             if separate_answers:
                                                 answers.append(ans_found if ans_found else " ")
+                                                
+                                            new_q_num += 1
                                         
                                         if separate_answers and answers:
                                             doc.add_heading("簡答表", level=2)
-                                            num_cols = 5
+                                            num_cols = 10
                                             table = doc.add_table(rows=0, cols=num_cols)
                                             table.style = 'Table Grid'
                                             for i in range(0, len(answers), num_cols):
