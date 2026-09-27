@@ -1205,15 +1205,14 @@ def main_app():
                                 if cat_qs:
                                     doc.add_heading(f'{cat.replace("/", " - ")}', 1)
                                     answers = []
-                                    new_q_num = 1
                                     
                                     for q in cat_qs:
                                         ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
                                         
                                         first_text_found = False
-                                        prefix = f"{new_q_num}. "
+                                        prefix = ""
                                         if include_year:
-                                            prefix += f"[{q.get('year_info', '')}]"
+                                            prefix = f"[{q.get('year_info', '')}] "
                                             
                                         for block in processed_blocks:
                                             if block['type'] == 'text':
@@ -1221,21 +1220,26 @@ def main_app():
                                                 if not first_text_found:
                                                     content = prefix + content
                                                     first_text_found = True
-                                                doc.add_paragraph(content)
+                                                    doc.add_paragraph(content, style='List Number')
+                                                else:
+                                                    p = doc.add_paragraph(content)
+                                                    p.paragraph_format.left_indent = Inches(0.25)
                                             elif block['type'] == 'image' and include_images:
                                                 if not first_text_found:
-                                                    doc.add_paragraph(prefix)
+                                                    doc.add_paragraph(prefix, style='List Number')
                                                     first_text_found = True
                                                 try:
                                                     img_res = requests.get(block['content'], timeout=10)
-                                                    if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
+                                                    if img_res.status_code == 200: 
+                                                        p_img = doc.add_paragraph()
+                                                        p_img.paragraph_format.left_indent = Inches(0.25)
+                                                        p_img.add_run().add_picture(io.BytesIO(img_res.content), width=Inches(4))
                                                 except:
-                                                    doc.add_paragraph("[圖片載入失敗]")
+                                                    p_fail = doc.add_paragraph("[圖片載入失敗]")
+                                                    p_fail.paragraph_format.left_indent = Inches(0.25)
                                         
                                         if separate_answers:
                                             answers.append(ans_found if ans_found else " ")
-                                            
-                                        new_q_num += 1
                                         
                                     if separate_answers and answers:
                                         doc.add_heading("簡答表", level=2)
@@ -1267,15 +1271,14 @@ def main_app():
                                         doc = Document()
                                         doc.add_heading(f'{cat.replace("/", "_")} 題庫', 0)
                                         answers = []
-                                        new_q_num = 1
                                         
                                         for q in cat_qs:
                                             ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
                                             
                                             first_text_found = False
-                                            prefix = f"{new_q_num}. "
+                                            prefix = ""
                                             if include_year:
-                                                prefix += f"[{q.get('year_info', '')}]"
+                                                prefix = f"[{q.get('year_info', '')}] "
                                                 
                                             for block in processed_blocks:
                                                 if block['type'] == 'text':
@@ -1283,20 +1286,26 @@ def main_app():
                                                     if not first_text_found:
                                                         content = prefix + content
                                                         first_text_found = True
-                                                    doc.add_paragraph(content)
+                                                        doc.add_paragraph(content, style='List Number')
+                                                    else:
+                                                        p = doc.add_paragraph(content)
+                                                        p.paragraph_format.left_indent = Inches(0.25)
                                                 elif block['type'] == 'image' and include_images:
                                                     if not first_text_found:
-                                                        doc.add_paragraph(prefix)
+                                                        doc.add_paragraph(prefix, style='List Number')
                                                         first_text_found = True
                                                     try:
                                                         img_res = requests.get(block['content'], timeout=10)
-                                                        if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
-                                                    except: pass
+                                                        if img_res.status_code == 200: 
+                                                            p_img = doc.add_paragraph()
+                                                            p_img.paragraph_format.left_indent = Inches(0.25)
+                                                            p_img.add_run().add_picture(io.BytesIO(img_res.content), width=Inches(4))
+                                                    except:
+                                                        p_fail = doc.add_paragraph("[圖片載入失敗]")
+                                                        p_fail.paragraph_format.left_indent = Inches(0.25)
                                             
                                             if separate_answers:
                                                 answers.append(ans_found if ans_found else " ")
-                                                
-                                            new_q_num += 1
                                         
                                         if separate_answers and answers:
                                             doc.add_heading("簡答表", level=2)
