@@ -1116,8 +1116,61 @@ def main_app():
             export_format = c_opts1.radio("匯出結構", ["合併為單一 Word 檔", "依資料夾分別打包 (ZIP)"])
             include_year = c_opts2.checkbox("匯出年份題號標記 (如: [114-2-1])", value=True)
             include_images = c_opts2.checkbox("匯出圖片", value=True)
+            separate_answers = c_opts2.checkbox("簡答分開輸出並製成表格", value=False)
             custom_title = c_opts3.text_input("單一合併檔主標題", "客製化分類題庫")
             
+            # 宣告跨區塊提取答案的函式
+            def process_blocks_for_export(blocks, separate_answers):
+                if not separate_answers:
+                    return "", blocks
+                    
+                ans_found = ""
+                new_blocks = []
+                state = "START"
+                
+                ans_pattern = re.compile(r"^\s*(?:\d+[\s\n]*)?\(([A-Ea-e])\)[\s\n]*")
+                qnum_pattern = re.compile(r"^\s*(?:\d+[\.．])[\s\n]*")
+                
+                for block in blocks:
+                    if block['type'] != 'text':
+                        new_blocks.append(block)
+                        continue
+                        
+                    text = block['content']
+                    
+                    if state == "START":
+                        match = ans_pattern.search(text)
+                        if match:
+                            ans_found = match.group(1).upper()
+                            text = text[match.end():]
+                            state = "FOUND_ANS"
+                            
+                            # 若同一個區塊內緊跟著題號也將其剔除
+                            qnum_match = qnum_pattern.search(text)
+                            if qnum_match:
+                                text = text[qnum_match.end():]
+                                
+                            if text.strip():
+                                new_blocks.append({"type": "text", "content": text.strip()})
+                        elif re.match(r"^\s*\d+\s*$", text):
+                            # 跳過獨立的純題號區塊 (例如單獨一行的 41)
+                            pass
+                        else:
+                            new_blocks.append(block)
+                            state = "NORMAL"
+                    elif state == "FOUND_ANS":
+                        # 已經找到答案，檢查此區塊開頭是否為題號並剔除
+                        qnum_match = qnum_pattern.search(text)
+                        if qnum_match:
+                            text = text[qnum_match.end():]
+                        if text.strip():
+                            new_blocks.append({"type": "text", "content": text.strip()})
+                        state = "NORMAL"
+                    else:
+                        new_blocks.append(block)
+                        
+                return ans_found, new_blocks
+
             if st.button("開始產生文件", type="primary", icon=":material/download:"):
                 if not export_cats:
                     st.warning("請至少選擇一個資料夾", icon=":material/warning:")
@@ -1151,17 +1204,39 @@ def main_app():
                                 
                                 if cat_qs:
                                     doc.add_heading(f'{cat.replace("/", " - ")}', 1)
+                                    answers = []
                                     for q in cat_qs:
                                         if include_year: doc.add_paragraph(f"[{q.get('year_info', '')}]")
-                                        for block in q.get('blocks', []):
-                                            if block['type'] == 'text': doc.add_paragraph(block['content'])
+                                        
+                                        ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
+                                        
+                                        for block in processed_blocks:
+                                            if block['type'] == 'text': 
+                                                doc.add_paragraph(block['content'])
                                             elif block['type'] == 'image' and include_images:
                                                 try:
                                                     img_res = requests.get(block['content'], timeout=10)
                                                     if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
                                                 except:
                                                     doc.add_paragraph("[圖片載入失敗]")
-                                        doc.add_paragraph("---")
+                                        
+                                        if separate_answers:
+                                            answers.append(ans_found if ans_found else " ")
+                                        
+                                    if separate_answers and answers:
+                                        doc.add_heading("簡答表", level=2)
+                                        num_cols = 5
+                                        table = doc.add_table(rows=0, cols=num_cols)
+                                        table.style = 'Table Grid'
+                                        for i in range(0, len(answers), num_cols):
+                                            row_cells_num = table.add_row().cells
+                                            row_cells_ans = table.add_row().cells
+                                            for j in range(num_cols):
+                                                idx = i + j
+                                                if idx < len(answers):
+                                                    row_cells_num[j].text = str(idx + 1)
+                                                    row_cells_ans[j].text = answers[idx]
+
                             doc_buffer = io.BytesIO()
                             doc.save(doc_buffer)
                             st.download_button("下載完整題庫 (Docx)", doc_buffer.getvalue(), f"{custom_title}.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
@@ -1177,16 +1252,38 @@ def main_app():
                                     if cat_qs:
                                         doc = Document()
                                         doc.add_heading(f'{cat.replace("/", "_")} 題庫', 0)
+                                        answers = []
                                         for q in cat_qs:
                                             if include_year: doc.add_paragraph(f"[{q.get('year_info', '')}]")
-                                            for block in q.get('blocks', []):
-                                                if block['type'] == 'text': doc.add_paragraph(block['content'])
+                                            
+                                            ans_found, processed_blocks = process_blocks_for_export(q.get('blocks', []), separate_answers)
+                                            
+                                            for block in processed_blocks:
+                                                if block['type'] == 'text': 
+                                                    doc.add_paragraph(block['content'])
                                                 elif block['type'] == 'image' and include_images:
                                                     try:
                                                         img_res = requests.get(block['content'], timeout=10)
                                                         if img_res.status_code == 200: doc.add_picture(io.BytesIO(img_res.content), width=Inches(4))
                                                     except: pass
-                                            doc.add_paragraph("---")
+                                            
+                                            if separate_answers:
+                                                answers.append(ans_found if ans_found else " ")
+                                        
+                                        if separate_answers and answers:
+                                            doc.add_heading("簡答表", level=2)
+                                            num_cols = 5
+                                            table = doc.add_table(rows=0, cols=num_cols)
+                                            table.style = 'Table Grid'
+                                            for i in range(0, len(answers), num_cols):
+                                                row_cells_num = table.add_row().cells
+                                                row_cells_ans = table.add_row().cells
+                                                for j in range(num_cols):
+                                                    idx = i + j
+                                                    if idx < len(answers):
+                                                        row_cells_num[j].text = str(idx + 1)
+                                                        row_cells_ans[j].text = answers[idx]
+
                                         doc_buffer = io.BytesIO()
                                         doc.save(doc_buffer)
                                         zip_file.writestr(f"分類_{cat.replace('/', '_')}.docx", doc_buffer.getvalue())
