@@ -125,6 +125,12 @@ if "recent_folders" not in st.session_state:
     st.session_state.recent_folders = []
 if "all_users" not in st.session_state:
     st.session_state.all_users = {}
+if "batch_mode" not in st.session_state:
+    st.session_state.batch_mode = False
+if "batch_qs" not in st.session_state:
+    st.session_state.batch_qs = []
+if "batch_idx" not in st.session_state:
+    st.session_state.batch_idx = 0
 
 # ==========================================
 # 3. 雲端同步與處理模組 (Lazy Loading 版)
@@ -467,6 +473,8 @@ def main_app():
                             f["locked_by"] = None
                             f["locked_at"] = None
                     sync_user_meta()
+            if p_name != "全站題目搜索與瀏覽":
+                st.session_state.batch_mode = False
             st.session_state.current_page = p_name
             st.rerun()
             
@@ -960,113 +968,281 @@ def main_app():
                     if c4.button("跳轉", icon=":material/keyboard_tab:"):
                         active_f['current_index'] = jump_to - 1; active_f['locked_at'] = time.time(); sync_user_meta(); st.rerun()
 
-    # ---------- 頁面 4：全站題目搜索與瀏覽 ----------
+# ---------- 頁面 4：全站題目搜索與瀏覽 ----------
     elif st.session_state.current_page == "全站題目搜索與瀏覽":
         st.header("全站題目搜索與瀏覽")
         
-        with st.container(border=True):
-            st.subheader("篩選條件")
-            s_col1, s_col2, s_col3, s_col4 = st.columns([2, 1.5, 1.5, 1], vertical_alignment="bottom")
-            search_text = s_col1.text_input("關鍵字搜尋 (針對題目內容)")
+        uid = st.session_state.user['localId']
+        
+        if st.session_state.get("batch_mode", False):
+            batch_q_ids = st.session_state.batch_qs
+            total_q = len(batch_q_ids)
+            curr_idx = st.session_state.batch_idx
             
-            main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
-            main_options = ["所有分類", "未分類"] + main_folders
-            selected_main = s_col2.selectbox("指定母資料夾", main_options, key="filter_main")
-
-            if selected_main in ["所有分類", "未分類"]:
-                filter_cat = selected_main
-                s_col3.selectbox("指定子資料夾", ["-"], disabled=True, key="filter_sub")
+            if total_q == 0 or curr_idx >= total_q:
+                st.success("批量重分作業已完成或無題目！")
+                if st.button("返回搜索與瀏覽", icon=":material/arrow_back:"):
+                    st.session_state.batch_mode = False
+                    db.collection("users").document(uid).update({"batch_qs": [], "batch_idx": 0})
+                    st.session_state.user_profile["batch_qs"] = []
+                    st.session_state.user_profile["batch_idx"] = 0
+                    st.rerun()
             else:
-                sub_options = ["(全部)"] + [c for c in st.session_state.categories if c == selected_main or c.startswith(selected_main + "/")]
-                selected_sub = s_col3.selectbox("指定子資料夾", sub_options, key="filter_sub")
-                filter_cat = selected_main if selected_sub == "(全部)" else selected_sub
-            
-            only_doubt = s_col4.checkbox("只看疑問區", value=False)
-            
-        # [優化] 依據搜尋條件 Lazy Loading 精準下載
-        query_key = f"search_{filter_cat}_{only_doubt}_{search_text.strip()}"
-        if st.session_state.loaded_page != query_key:
-            with st.spinner("撈取雲端題目中..."):
-                q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
+                current_q_id = batch_q_ids[curr_idx]
+                current_q = next((q for q in st.session_state.questions if q["q_id"] == current_q_id), None)
                 
-                if filter_cat != "所有分類":
-                    if filter_cat == "未分類":
-                        docs = q_ref.where("category", "==", "未分類").stream()
+                if not current_q:
+                    # 避免記憶體清空導致瘋狂跳號，改為直接從雲端資料庫單筆撈取補回記憶體
+                    doc_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions").document(current_q_id).get()
+                    if doc_ref.exists:
+                        current_q = doc_ref.to_dict()
+                        st.session_state.questions.append(current_q)
                     else:
-                        # Firestore 前綴搜尋法
-                        docs = q_ref.where("category", ">=", filter_cat).where("category", "<", filter_cat + "\uf8ff").stream()
-                elif only_doubt:
-                    docs = q_ref.where("is_doubt", "==", True).stream()
-                elif search_text.strip():
-                    docs = q_ref.stream()
-                else:
-                    docs = q_ref.limit(100).stream()
-                    st.info("提示：目前為預覽模式（顯示前 100 題）。請輸入關鍵字或選擇分類進行精確搜尋。", icon=":material/info:")
-                    
-                raw_qs = [doc.to_dict() for doc in docs]
-                st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
-                st.session_state.loaded_page = query_key
-                
-        filtered_qs = []
-        for q in st.session_state.questions:
-            if search_text and search_text.lower() not in q.get('_raw_text', '').lower():
-                continue
-            if only_doubt and not q.get('is_doubt', False):
-                continue
-            filtered_qs.append(q)
-            
-        st.write(f"符合條件共 **{len(filtered_qs)}** 題")
-        
-        PAGE_SIZE = 15
-        total_pages = math.ceil(len(filtered_qs) / PAGE_SIZE) if filtered_qs else 1
-        
-        if len(filtered_qs) > 0:
-            page_num = st.number_input("頁碼", min_value=1, max_value=total_pages, value=1)
-            start_idx = (page_num - 1) * PAGE_SIZE
-            end_idx = start_idx + PAGE_SIZE
-            
-            for q in filtered_qs[start_idx:end_idx]:
-                raw_text = q.get('_raw_text', '').strip()
-                raw_text_single_line = " ".join(raw_text.splitlines())
-                
-                snippet_len = 30
-                snippet = raw_text_single_line[:snippet_len] + "..." if len(raw_text_single_line) > snippet_len else raw_text_single_line
-                    
-                expander_icon = ":material/help:" if q.get("is_doubt", False) else ":material/article:"
-                expander_title = f"[{q.get('year_info', '未標記')}] {snippet} - 分類: {q.get('category', '未分類')}"
-                
-                with st.expander(expander_title, icon=expander_icon):
-                    for block in q.get('blocks', []):
-                        if block['type'] == 'text': 
-                            content = block['content']
-                            if search_text:
-                                pattern = re.compile(re.escape(search_text), re.IGNORECASE)
-                                content = pattern.sub(lambda m: f":red[**{m.group(0)}**]", content)
-                            st.markdown(content)
+                        # 只有真的在資料庫中被刪除了，才跳過該題
+                        st.session_state.batch_idx += 1
+                        db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                        st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                        st.rerun()
+                        
+                c_title, c_helper, c_exit = st.columns([3, 1, 1], vertical_alignment="center")
+                with c_title:
+                    st.markdown(f"**批量重分作業 (目前分類：{current_q.get('category', '未分類')})**")
+                    st.progress((curr_idx + 1) / total_q, text=f"進度：第 {curr_idx + 1} 題 / 共 {total_q} 題")
+                with c_helper:
+                    with st.popover("中藥查詢", icon=":material/lightbulb:", use_container_width=True):
+                        st.markdown("**中藥分類查詢**")
+                        search_kw = st.text_input("輸入關鍵字", key=f"batch_herb_{curr_idx}", placeholder="例如: 參")
+                        if search_kw:
+                            try:
+                                import cate
+                                import importlib
+                                importlib.reload(cate) 
+                                results = cate.search_herb(search_kw.strip())
+                                if results:
+                                    for r in results:
+                                        herb_name = r['herb'].replace(search_kw.strip(), f":red[**{search_kw.strip()}**]")
+                                        st.markdown(f"- {herb_name} : `{r['category']}`")
+                                else:
+                                    st.caption("查無符合的中藥。")
+                            except ImportError:
+                                st.error("找不到 cate.py 檔案", icon=":material/error:")
+                            except AttributeError:
+                                st.error("請確認 cate.py 檔案已儲存，且包含 search_herb 函式。", icon=":material/error:")
+                with c_exit:
+                    if st.button("退出重分", icon=":material/exit_to_app:", use_container_width=True):
+                        st.session_state.batch_mode = False
+                        st.rerun()
+
+                with st.container(border=True):
+                    doubt_badge = " **(已標記為疑問)**" if current_q.get("is_doubt", False) else ""
+                    st.caption(f"原始年份： `{current_q.get('year_info', '未標記')}` {doubt_badge}")
+                    for block in current_q.get('blocks', []):
+                        if block['type'] == 'text': st.write(block['content'])
                         elif block['type'] == 'image': st.image(block['content'])
                     
-                    st.divider()
-                    render_categorizer_info(q.get("categorizer_uid"))
-                    
-                    col_act1, col_act2, col_act3 = st.columns([1.2, 1.2, 2])
-                    if col_act1.button("移回未分類", key=f"del_{q.get('q_id')}", icon=":material/delete:"):
-                        update_single_question_category(q["q_id"], "未分類", q.get("year_info", ""))
-                        st.rerun()
-                        
-                    doubt_btn_text = "取消疑問標記" if q.get("is_doubt", False) else "標記為疑問"
-                    if col_act2.button(doubt_btn_text, key=f"toggle_doubt_{q.get('q_id')}", icon=":material/help_center:"):
-                        new_doubt_status = not q.get("is_doubt", False)
-                        update_single_question_category(q["q_id"], q.get("category", "未分類"), q.get("year_info", ""), new_doubt_status)
-                        st.rerun()
-                        
-                    with col_act3.popover("重新分類", icon=":material/drive_file_move:"):
-                        c_main_pop = st.container()
-                        c_sub_pop = st.container()
-                        new_cat = hierarchical_select("選擇新分類", st.session_state.categories, f"reclass_{q['q_id']}", col_layout=(c_main_pop, c_sub_pop))
-                        if st.button("確定移動", key=f"btn_reclass_{q['q_id']}", icon=":material/check_circle:", type="primary", use_container_width=True):
-                            update_single_question_category(q["q_id"], new_cat, q.get("year_info", ""), q.get("is_doubt", False))
-                            st.rerun()
+                    render_categorizer_info(current_q.get("categorizer_uid"))
 
+                st.markdown("### 快速重分類")
+                if not st.session_state.categories:
+                    st.info("尚無資料夾", icon=":material/info:")
+                else:
+                    is_doubt = st.checkbox("標記為疑問 (加入疑問區)", value=current_q.get("is_doubt", False), key=f"batch_doubt_{current_q_id}")
+                    
+                    c_sel_main, c_sel_sub, c_btn = st.columns([1.5, 1.5, 1], vertical_alignment="bottom")
+                    selected_cat = hierarchical_select(
+                        "重新分類至", 
+                        st.session_state.categories, 
+                        "batch_classify", 
+                        default_cat=st.session_state.last_used_folder or current_q.get("category"), 
+                        col_layout=(c_sel_main, c_sel_sub)
+                    )
+                    
+                    if c_btn.button("確定分類", type="primary", use_container_width=True, icon=":material/check_circle:"):
+                        update_single_question_category(current_q["q_id"], selected_cat, current_q.get("year_info", ""), is_doubt)
+                        
+                        st.session_state.last_used_folder = selected_cat
+                        if selected_cat in st.session_state.recent_folders:
+                            st.session_state.recent_folders.remove(selected_cat)
+                        st.session_state.recent_folders.insert(0, selected_cat)
+                        if len(st.session_state.recent_folders) > 5:
+                            st.session_state.recent_folders = st.session_state.recent_folders[:5]
+                            
+                        st.session_state.batch_idx += 1
+                        db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                        st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                        st.rerun()
+
+                    if st.session_state.recent_folders:
+                        st.markdown("##### 最近使用的分類快捷鍵")
+                        recent_cols = st.columns(5)
+                        for i, r_cat in enumerate(st.session_state.recent_folders):
+                            display_name = r_cat.split('/')[-1]
+                            if recent_cols[i].button(display_name, key=f"batch_recent_{r_cat}_{current_q_id}", help=r_cat, use_container_width=True):
+                                update_single_question_category(current_q["q_id"], r_cat, current_q.get("year_info", ""), is_doubt)
+                                
+                                st.session_state.last_used_folder = r_cat
+                                st.session_state.recent_folders.remove(r_cat)
+                                st.session_state.recent_folders.insert(0, r_cat)
+                                
+                                st.session_state.batch_idx += 1
+                                db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                                st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                                st.rerun()
+
+                st.divider()
+                c1, c2, c3, c4 = st.columns(4)
+                if c1.button("上一題", icon=":material/arrow_back:") and curr_idx > 0:
+                    st.session_state.batch_idx -= 1
+                    db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                    st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                    st.rerun()
+                if c2.button("下一題 (跳過)", icon=":material/skip_next:") and curr_idx < total_q - 1:
+                    st.session_state.batch_idx += 1
+                    db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                    st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                    st.rerun()
+                jump_to = c3.number_input("跳題", 1, total_q, curr_idx + 1, label_visibility="collapsed")
+                if c4.button("跳轉", icon=":material/keyboard_tab:"):
+                    st.session_state.batch_idx = jump_to - 1
+                    db.collection("users").document(uid).update({"batch_idx": st.session_state.batch_idx})
+                    st.session_state.user_profile["batch_idx"] = st.session_state.batch_idx
+                    st.rerun()
+
+        else:
+            resume_qs = st.session_state.user_profile.get("batch_qs", [])
+            resume_idx = st.session_state.user_profile.get("batch_idx", 0)
+            
+            if resume_qs and resume_idx < len(resume_qs):
+                with st.container(border=True):
+                    st.info(f"發現未完成的批量重分作業！(進度：{resume_idx} / {len(resume_qs)})", icon=":material/info:")
+                    c_res1, c_res2 = st.columns(2)
+                    if c_res1.button("繼續未完成的作業", icon=":material/play_arrow:", type="primary", use_container_width=True):
+                        st.session_state.batch_mode = True
+                        st.session_state.batch_qs = resume_qs
+                        st.session_state.batch_idx = resume_idx
+                        st.rerun()
+                    if c_res2.button("放棄該進度", icon=":material/delete:", use_container_width=True):
+                        db.collection("users").document(uid).update({"batch_qs": [], "batch_idx": 0})
+                        st.session_state.user_profile["batch_qs"] = []
+                        st.session_state.user_profile["batch_idx"] = 0
+                        st.rerun()
+            
+            with st.container(border=True):
+                st.subheader("篩選條件")
+                s_col1, s_col2, s_col3, s_col4 = st.columns([2, 1.5, 1.5, 1], vertical_alignment="bottom")
+                search_text = s_col1.text_input("關鍵字搜尋 (針對題目內容)")
+                
+                main_folders = list(dict.fromkeys([c.split("/")[0] for c in st.session_state.categories]))
+                main_options = ["所有分類", "未分類"] + main_folders
+                selected_main = s_col2.selectbox("指定母資料夾", main_options, key="filter_main")
+
+                if selected_main in ["所有分類", "未分類"]:
+                    filter_cat = selected_main
+                    s_col3.selectbox("指定子資料夾", ["-"], disabled=True, key="filter_sub")
+                else:
+                    sub_options = ["(全部)"] + [c for c in st.session_state.categories if c == selected_main or c.startswith(selected_main + "/")]
+                    selected_sub = s_col3.selectbox("指定子資料夾", sub_options, key="filter_sub")
+                    filter_cat = selected_main if selected_sub == "(全部)" else selected_sub
+                
+                only_doubt = s_col4.checkbox("只看疑問區", value=False)
+                
+            query_key = f"search_{filter_cat}_{only_doubt}_{search_text.strip()}"
+            if st.session_state.loaded_page != query_key:
+                with st.spinner("撈取雲端題目中..."):
+                    q_ref = db.collection("workspaces").document(SHARED_WORKSPACE).collection("questions")
+                    
+                    if filter_cat != "所有分類":
+                        if filter_cat == "未分類":
+                            docs = q_ref.where("category", "==", "未分類").stream()
+                        else:
+                            docs = q_ref.where("category", ">=", filter_cat).where("category", "<", filter_cat + "\uf8ff").stream()
+                    elif only_doubt:
+                        docs = q_ref.where("is_doubt", "==", True).stream()
+                    elif search_text.strip():
+                        docs = q_ref.stream()
+                    else:
+                        docs = q_ref.limit(100).stream()
+                        st.info("提示：目前為預覽模式（顯示前 100 題）。請輸入關鍵字或選擇分類進行精確搜尋。", icon=":material/info:")
+                        
+                    raw_qs = [doc.to_dict() for doc in docs]
+                    st.session_state.questions = sorted(raw_qs, key=lambda x: (x.get("file_id", ""), x.get("order_index", 0)))
+                    st.session_state.loaded_page = query_key
+                    
+            filtered_qs = []
+            for q in st.session_state.questions:
+                if search_text and search_text.lower() not in q.get('_raw_text', '').lower():
+                    continue
+                if only_doubt and not q.get('is_doubt', False):
+                    continue
+                filtered_qs.append(q)
+                
+            c_info1, c_info2 = st.columns([2, 1], vertical_alignment="center")
+            with c_info1:
+                st.write(f"符合條件共 **{len(filtered_qs)}** 題")
+            with c_info2:
+                if len(filtered_qs) > 0:
+                    if st.button("以此篩選條件進行「批量重分」", icon=":material/rule_folder:", type="primary", use_container_width=True):
+                        st.session_state.batch_mode = True
+                        st.session_state.batch_qs = [q["q_id"] for q in filtered_qs]
+                        st.session_state.batch_idx = 0
+                        db.collection("users").document(uid).update({
+                            "batch_qs": st.session_state.batch_qs,
+                            "batch_idx": 0
+                        })
+                        st.session_state.user_profile["batch_qs"] = st.session_state.batch_qs
+                        st.session_state.user_profile["batch_idx"] = 0
+                        st.rerun()
+            
+            PAGE_SIZE = 15
+            total_pages = math.ceil(len(filtered_qs) / PAGE_SIZE) if filtered_qs else 1
+            
+            if len(filtered_qs) > 0:
+                page_num = st.number_input("頁碼", min_value=1, max_value=total_pages, value=1)
+                start_idx = (page_num - 1) * PAGE_SIZE
+                end_idx = start_idx + PAGE_SIZE
+                
+                for q in filtered_qs[start_idx:end_idx]:
+                    raw_text = q.get('_raw_text', '').strip()
+                    raw_text_single_line = " ".join(raw_text.splitlines())
+                    
+                    snippet_len = 30
+                    snippet = raw_text_single_line[:snippet_len] + "..." if len(raw_text_single_line) > snippet_len else raw_text_single_line
+                        
+                    expander_icon = ":material/help:" if q.get("is_doubt", False) else ":material/article:"
+                    expander_title = f"[{q.get('year_info', '未標記')}] {snippet} - 分類: {q.get('category', '未分類')}"
+                    
+                    with st.expander(expander_title, icon=expander_icon):
+                        for block in q.get('blocks', []):
+                            if block['type'] == 'text': 
+                                content = block['content']
+                                if search_text:
+                                    pattern = re.compile(re.escape(search_text), re.IGNORECASE)
+                                    content = pattern.sub(lambda m: f":red[**{m.group(0)}**]", content)
+                                st.markdown(content)
+                            elif block['type'] == 'image': st.image(block['content'])
+                        
+                        st.divider()
+                        render_categorizer_info(q.get("categorizer_uid"))
+                        
+                        col_act1, col_act2, col_act3 = st.columns([1.2, 1.2, 2])
+                        if col_act1.button("移回未分類", key=f"del_{q.get('q_id')}", icon=":material/delete:"):
+                            update_single_question_category(q["q_id"], "未分類", q.get("year_info", ""))
+                            st.rerun()
+                            
+                        doubt_btn_text = "取消疑問標記" if q.get("is_doubt", False) else "標記為疑問"
+                        if col_act2.button(doubt_btn_text, key=f"toggle_doubt_{q.get('q_id')}", icon=":material/help_center:"):
+                            new_doubt_status = not q.get("is_doubt", False)
+                            update_single_question_category(q["q_id"], q.get("category", "未分類"), q.get("year_info", ""), new_doubt_status)
+                            st.rerun()
+                            
+                        with col_act3.popover("重新分類", icon=":material/drive_file_move:"):
+                            c_main_pop = st.container()
+                            c_sub_pop = st.container()
+                            new_cat = hierarchical_select("選擇新分類", st.session_state.categories, f"reclass_{q['q_id']}", col_layout=(c_main_pop, c_sub_pop))
+                            if st.button("確定移動", key=f"btn_reclass_{q['q_id']}", icon=":material/check_circle:", type="primary", use_container_width=True):
+                                update_single_question_category(q["q_id"], new_cat, q.get("year_info", ""), q.get("is_doubt", False))
+                                st.rerun()
+    
     # ---------- 頁面 5：題目匯出 ----------
     elif st.session_state.current_page == "題目匯出":
         st.header("客製化題庫匯出")
